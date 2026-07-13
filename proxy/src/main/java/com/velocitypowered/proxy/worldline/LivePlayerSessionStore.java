@@ -29,6 +29,7 @@ import java.util.concurrent.atomic.AtomicReference;
 public final class LivePlayerSessionStore {
 
   private final Map<UUID, LivePlayerSession> sessions = new ConcurrentHashMap<>();
+  private final Map<UUID, Long> phaseEnteredNanos = new ConcurrentHashMap<>();
   private final TransitionHook transitionHook;
 
   /**
@@ -59,6 +60,7 @@ public final class LivePlayerSessionStore {
       return new LivePlayerSession(playerUuid, clientConnectionId, serverId, 0, null,
           HandoffPhase.ACTIVE_SOURCE);
     });
+    phaseEnteredNanos.putIfAbsent(playerUuid, System.nanoTime());
   }
 
   /**
@@ -72,6 +74,7 @@ public final class LivePlayerSessionStore {
    * Removes a disconnected player's live session record.
    */
   public Optional<LivePlayerSession> remove(final UUID playerUuid) {
+    phaseEnteredNanos.remove(playerUuid);
     return Optional.ofNullable(sessions.remove(playerUuid));
   }
 
@@ -85,6 +88,7 @@ public final class LivePlayerSessionStore {
         return current;
       }
       removed.set(current);
+      phaseEnteredNanos.remove(playerUuid);
       return null;
     });
     return Optional.ofNullable(removed.get());
@@ -114,7 +118,7 @@ public final class LivePlayerSessionStore {
         return current;
       }
       if (!current.authoritativeServerId().equals(expectedSourceServerId)
-          || current.handoffPhase() != HandoffPhase.ACTIVE_SOURCE) {
+          || !current.handoffPhase().canTransitionTo(HandoffPhase.PREPARING_DESTINATION)) {
         result.set(TransitionResult.rejectedMismatch(current));
         return current;
       }
@@ -194,9 +198,7 @@ public final class LivePlayerSessionStore {
       }
       if (!transferId.equals(current.activeTransferId())
           || !current.authoritativeServerId().equals(expectedSourceServerId)
-          || current.handoffPhase() == HandoffPhase.COMMITTED
-          || current.handoffPhase() == HandoffPhase.ACTIVE_DESTINATION
-          || current.handoffPhase() == HandoffPhase.SOURCE_CLEANED) {
+          || !current.handoffPhase().canTransitionTo(HandoffPhase.ACTIVE_SOURCE)) {
         result.set(TransitionResult.rejectedMismatch(current));
         return current;
       }
@@ -235,7 +237,7 @@ public final class LivePlayerSessionStore {
       }
       if (!current.authoritativeServerId().equals(expectedSourceServerId)
           || !transferId.equals(current.activeTransferId())
-          || current.handoffPhase() != HandoffPhase.SNAPSHOT_STAGED) {
+          || !current.handoffPhase().canTransitionTo(HandoffPhase.COMMITTED)) {
         result.set(TransitionResult.rejectedMismatch(current));
         return current;
       }
@@ -259,11 +261,13 @@ public final class LivePlayerSessionStore {
         result.set(TransitionResult.rejectedStaleEpoch(current));
         return current;
       }
-      if (transferId.equals(current.activeTransferId()) && current.handoffPhase() == nextPhase) {
+      if (transferId.equals(current.activeTransferId())
+          && current.handoffPhase().ordinal() >= nextPhase.ordinal()) {
         result.set(TransitionResult.alreadyApplied(current));
         return current;
       }
-      if (!transferId.equals(current.activeTransferId()) || current.handoffPhase() != expectedPhase) {
+      if (!transferId.equals(current.activeTransferId()) || current.handoffPhase() != expectedPhase
+          || !current.handoffPhase().canTransitionTo(nextPhase)) {
         result.set(TransitionResult.rejectedMismatch(current));
         return current;
       }
@@ -278,8 +282,26 @@ public final class LivePlayerSessionStore {
   private LivePlayerSession apply(final String transitionName, final LivePlayerSession before,
       final LivePlayerSession after, final AtomicReference<TransitionResult> result) {
     transitionHook.beforeTransition(transitionName, before, after);
-    result.set(TransitionResult.applied(before, after));
+    long now = System.nanoTime();
+    long elapsedNanos = now - phaseEnteredNanos.getOrDefault(before.playerUuid(), now);
+    phaseEnteredNanos.put(before.playerUuid(), now);
+    result.set(TransitionResult.applied(before, after, elapsedNanos));
     return after;
+  }
+
+  TransitionResult rejectedPartitionEpoch(final UUID playerUuid) {
+    return get(playerUuid).map(TransitionResult::rejectedPartitionEpoch)
+        .orElseGet(TransitionResult::missing);
+  }
+
+  TransitionResult controlUnavailable(final UUID playerUuid) {
+    return get(playerUuid).map(TransitionResult::controlUnavailable)
+        .orElseGet(TransitionResult::missing);
+  }
+
+  TransitionResult injectedDrop(final UUID playerUuid) {
+    return get(playerUuid).map(TransitionResult::injectedDrop)
+        .orElseGet(TransitionResult::missing);
   }
 
   /**
@@ -298,25 +320,44 @@ public final class LivePlayerSessionStore {
    * Result of an attempted conditional live-session transition.
    */
   public record TransitionResult(Status status, Optional<LivePlayerSession> before,
-                                 Optional<LivePlayerSession> after) {
-    static TransitionResult applied(final LivePlayerSession before, final LivePlayerSession after) {
-      return new TransitionResult(Status.APPLIED, Optional.of(before), Optional.of(after));
+                                 Optional<LivePlayerSession> after, long elapsedPhaseNanos) {
+    static TransitionResult applied(final LivePlayerSession before, final LivePlayerSession after,
+        final long elapsedPhaseNanos) {
+      return new TransitionResult(Status.APPLIED, Optional.of(before), Optional.of(after),
+          elapsedPhaseNanos);
     }
 
     static TransitionResult alreadyApplied(final LivePlayerSession current) {
-      return new TransitionResult(Status.ALREADY_APPLIED, Optional.of(current), Optional.of(current));
+      return unchanged(Status.ALREADY_APPLIED, current);
     }
 
     static TransitionResult rejectedStaleEpoch(final LivePlayerSession current) {
-      return new TransitionResult(Status.REJECTED_STALE_EPOCH, Optional.of(current), Optional.of(current));
+      return unchanged(Status.REJECTED_STALE_EPOCH, current);
     }
 
     static TransitionResult rejectedMismatch(final LivePlayerSession current) {
-      return new TransitionResult(Status.REJECTED_MISMATCH, Optional.of(current), Optional.of(current));
+      return unchanged(Status.REJECTED_MISMATCH, current);
+    }
+
+    static TransitionResult rejectedPartitionEpoch(final LivePlayerSession current) {
+      return unchanged(Status.REJECTED_PARTITION_EPOCH, current);
+    }
+
+    static TransitionResult controlUnavailable(final LivePlayerSession current) {
+      return unchanged(Status.CONTROL_UNAVAILABLE, current);
+    }
+
+    static TransitionResult injectedDrop(final LivePlayerSession current) {
+      return unchanged(Status.INJECTED_DROP, current);
     }
 
     static TransitionResult missing() {
-      return new TransitionResult(Status.MISSING_SESSION, Optional.empty(), Optional.empty());
+      return new TransitionResult(Status.MISSING_SESSION, Optional.empty(), Optional.empty(), 0);
+    }
+
+    private static TransitionResult unchanged(final Status status,
+        final LivePlayerSession current) {
+      return new TransitionResult(status, Optional.of(current), Optional.of(current), 0);
     }
   }
 
@@ -327,7 +368,10 @@ public final class LivePlayerSessionStore {
     APPLIED,
     ALREADY_APPLIED,
     REJECTED_STALE_EPOCH,
+    REJECTED_PARTITION_EPOCH,
     REJECTED_MISMATCH,
+    CONTROL_UNAVAILABLE,
+    INJECTED_DROP,
     MISSING_SESSION
   }
 }

@@ -441,6 +441,7 @@ public class VelocityServer implements ProxyServer, ForwardingAudience {
     }
     try {
       StaticPartitionMap partitionMap = StaticPartitionMap.read(path);
+      worldlineControlPlane.configure(partitionMap);
       worldlineBoundaryDetector = Optional.of(new BoundaryCrossingDetector(partitionMap,
           partitionMap.levelName(), partitionMap.dimension(), 1));
       logger.info("Loaded Worldline boundary config from {}", path);

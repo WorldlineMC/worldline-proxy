@@ -581,6 +581,13 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
     return false;
   }
 
+  @Override
+  public boolean handle(JoinGamePacket packet) {
+    // Forward the packet as normal, but discard any chat state we have queued - the client will do this too
+    player.discardChatQueue();
+    return false;
+  }
+
   private void abortWorldlineHandoff(final String serverId,
       final BoundaryCrossingDetector.Decision decision) {
     UUID transferId = worldlineTransferId;
@@ -605,14 +612,8 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
     return new ControlEnvelope(HandoffControlPlane.PROTOCOL_VERSION, transferId,
         player.getUniqueId(), sourceServerId, destinationServerId,
         decision.sourcePartitionId().orElse("unknown"),
-        decision.remotePartitionId().orElse("unknown"), 0, 0, session.playerSessionEpoch(), 0);
-  }
-
-  @Override
-  public boolean handle(JoinGamePacket packet) {
-    // Forward the packet as normal, but discard any chat state we have queued - the client will do this too
-    player.discardChatQueue();
-    return false;
+        decision.remotePartitionId().orElse("unknown"), decision.sourcePartitionEpoch(),
+        decision.remotePartitionEpoch(), session.playerSessionEpoch(), 0);
   }
 
   @Override

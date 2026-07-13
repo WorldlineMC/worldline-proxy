@@ -28,5 +28,21 @@ public enum HandoffPhase {
   SNAPSHOT_STAGED,
   COMMITTED,
   ACTIVE_DESTINATION,
-  SOURCE_CLEANED
+  SOURCE_CLEANED;
+
+  /**
+   * Returns whether this phase may transition directly to the supplied phase.
+   */
+  public boolean canTransitionTo(final HandoffPhase next) {
+    return switch (this) {
+      case ACTIVE_SOURCE -> next == PREPARING_DESTINATION;
+      case PREPARING_DESTINATION -> next == DESTINATION_READY || next == ACTIVE_SOURCE;
+      case DESTINATION_READY -> next == SOURCE_FROZEN || next == ACTIVE_SOURCE;
+      case SOURCE_FROZEN -> next == SNAPSHOT_STAGED || next == ACTIVE_SOURCE;
+      case SNAPSHOT_STAGED -> next == COMMITTED || next == ACTIVE_SOURCE;
+      case COMMITTED -> next == ACTIVE_DESTINATION;
+      case ACTIVE_DESTINATION -> next == SOURCE_CLEANED;
+      case SOURCE_CLEANED -> false;
+    };
+  }
 }

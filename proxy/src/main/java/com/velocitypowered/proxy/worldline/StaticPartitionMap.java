@@ -20,9 +20,12 @@ package com.velocitypowered.proxy.worldline;
 import com.electronwill.nightconfig.core.Config;
 import com.electronwill.nightconfig.core.file.CommentedFileConfig;
 import java.io.IOException;
+import java.net.InetSocketAddress;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import org.checkerframework.checker.nullness.qual.Nullable;
 
@@ -33,12 +36,14 @@ public final class StaticPartitionMap {
 
   private final String levelName;
   private final String dimension;
+  private final Map<String, InetSocketAddress> controlAddresses;
   private final List<Partition> partitions;
 
   private StaticPartitionMap(final String levelName, final String dimension,
-      final List<Partition> partitions) {
+      final Map<String, InetSocketAddress> controlAddresses, final List<Partition> partitions) {
     this.levelName = levelName;
     this.dimension = dimension;
+    this.controlAddresses = Map.copyOf(controlAddresses);
     this.partitions = List.copyOf(partitions);
   }
 
@@ -50,13 +55,22 @@ public final class StaticPartitionMap {
       config.load();
       String levelName = require(config, "world.level-name");
       String dimension = require(config, "world.dimension");
+      Config serverConfigs = require(config, "servers");
+      Map<String, InetSocketAddress> controlAddresses = new HashMap<>();
+      for (Map.Entry<String, Object> entry : serverConfigs.valueMap().entrySet()) {
+        if (!(entry.getValue() instanceof Config server)) {
+          throw new IllegalArgumentException("Invalid server " + entry.getKey());
+        }
+        controlAddresses.put(entry.getKey(), parseAddress(require(server, "control-address")));
+      }
       List<? extends Config> partitionConfigs = require(config, "partitions");
       List<Partition> partitions = new ArrayList<>();
       for (Config partition : partitionConfigs) {
         partitions.add(new Partition(require(partition, "id"), require(partition, "owner"),
-            partition.get("chunk-x-min"), partition.get("chunk-x-max")));
+            requireNumber(partition, "epoch").longValue(), partition.get("chunk-x-min"),
+            partition.get("chunk-x-max")));
       }
-      return new StaticPartitionMap(levelName, dimension, partitions);
+      return new StaticPartitionMap(levelName, dimension, controlAddresses, partitions);
     } catch (RuntimeException e) {
       throw new IOException("Invalid Worldline partition map: " + path, e);
     }
@@ -97,6 +111,33 @@ public final class StaticPartitionMap {
     return dimension;
   }
 
+  /**
+   * Returns the experimental control endpoint for a server.
+   */
+  public Optional<InetSocketAddress> controlAddress(final String serverId) {
+    return Optional.ofNullable(controlAddresses.get(serverId));
+  }
+
+  /**
+   * Checks a partition ownership fence from a handoff envelope.
+   */
+  public boolean owns(final String partitionId, final String serverId, final long epoch) {
+    return partitions.stream().anyMatch(partition -> partition.id().equals(partitionId)
+        && partition.owner().equals(serverId) && partition.epoch() == epoch);
+  }
+
+  private static InetSocketAddress parseAddress(final String value) {
+    int separator = value.lastIndexOf(':');
+    if (separator <= 0 || separator == value.length() - 1) {
+      throw new IllegalArgumentException("Invalid control address " + value);
+    }
+    int port = Integer.parseInt(value.substring(separator + 1));
+    if (port < 1 || port > 65535) {
+      throw new IllegalArgumentException("Invalid control port " + port);
+    }
+    return new InetSocketAddress(value.substring(0, separator), port);
+  }
+
   private static <T> T require(final Config config, final String path) {
     T value = config.get(path);
     if (value == null) {
@@ -105,7 +146,16 @@ public final class StaticPartitionMap {
     return value;
   }
 
-  public record Partition(String id, String owner, @Nullable Integer chunkMin,
+  private static Number requireNumber(final Config config, final String path) {
+    Object value = require(config, path);
+    if (!(value instanceof Number number)) {
+      throw new IllegalArgumentException("Invalid number " + path);
+    }
+    return number;
+  }
+
+  /** Static slice partition and its ownership fence. */
+  public record Partition(String id, String owner, long epoch, @Nullable Integer chunkMin,
                           @Nullable Integer chunkMax) {
     boolean contains(final int chunkX) {
       return (chunkMin == null || chunkX >= chunkMin)

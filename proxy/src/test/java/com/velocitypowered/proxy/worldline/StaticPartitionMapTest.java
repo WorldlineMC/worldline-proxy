@@ -18,6 +18,7 @@
 package com.velocitypowered.proxy.worldline;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.file.Files;
@@ -41,14 +42,22 @@ public class StaticPartitionMapTest {
         level-name = "world"
         dimension = "minecraft:overworld"
 
+        [servers.server-a]
+        control-address = "127.0.0.1:25576"
+
+        [servers.server-b]
+        control-address = "127.0.0.1:25577"
+
         [[partitions]]
         id = "west"
         owner = "server-a"
+        epoch = 1
         chunk-x-max = -1
 
         [[partitions]]
         id = "east"
         owner = "server-b"
+        epoch = 1
         chunk-x-min = 0
         """);
 
@@ -58,6 +67,9 @@ public class StaticPartitionMapTest {
     assertEquals("server-b", map.ownerFor("world", "minecraft:overworld", 0).orElseThrow());
     assertEquals("west", map.partitionFor("world", "minecraft:overworld", -1).orElseThrow().id());
     assertEquals("east", map.partitionFor("world", "minecraft:overworld", 0).orElseThrow().id());
+    assertEquals(25576, map.controlAddress("server-a").orElseThrow().getPort());
+    assertTrue(map.owns("east", "server-b", 1));
+    assertFalse(map.owns("east", "server-b", 0));
     assertTrue(map.ownerFor("other", "minecraft:overworld", 0).isEmpty());
   }
 }

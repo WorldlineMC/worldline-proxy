@@ -112,6 +112,12 @@ tasks {
         workingDir = file("run").also(File::mkdirs)
         standardInput = System.`in` // Doesn't work?
     }
+    register<JavaExec>("runM2PrepareAbort") {
+        dependsOn(testClasses)
+        classpath = sourceSets.test.get().runtimeClasspath
+        mainClass.set("com.velocitypowered.proxy.worldline.HandoffControlPlaneDemo")
+        args(rootProject.layout.projectDirectory.dir("../harness/worldline.toml").asFile)
+    }
 }
 
 val projectVersion = version as String

@@ -166,14 +166,22 @@ public class ServerboundMovementRouterTest {
         level-name = "world"
         dimension = "minecraft:overworld"
 
+        [servers.server-a]
+        control-address = "127.0.0.1:25576"
+
+        [servers.server-b]
+        control-address = "127.0.0.1:25577"
+
         [[partitions]]
         id = "west"
         owner = "server-a"
+        epoch = 1
         chunk-x-max = -1
 
         [[partitions]]
         id = "east"
         owner = "server-b"
+        epoch = 1
         chunk-x-min = 0
         """);
     return new BoundaryCrossingDetector(StaticPartitionMap.read(config),

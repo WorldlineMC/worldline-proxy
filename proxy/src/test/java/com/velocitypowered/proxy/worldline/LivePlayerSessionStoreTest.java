@@ -98,6 +98,38 @@ public class LivePlayerSessionStoreTest {
   }
 
   @Test
+  void commitRejectsEveryChangedExpectationWithoutMutation() {
+    LivePlayerSessionStore store = stagedStore();
+    UUID wrongTransfer = UUID.fromString("00000000-0000-0000-0000-000000000004");
+
+    assertEquals(REJECTED_MISMATCH,
+        store.commit(PLAYER, 0, TRANSFER, "server-x", "server-b").status());
+    assertEquals(REJECTED_MISMATCH,
+        store.commit(PLAYER, 0, wrongTransfer, "server-a", "server-b").status());
+    assertEquals(REJECTED_STALE_EPOCH,
+        store.commit(PLAYER, 1, TRANSFER, "server-a", "server-b").status());
+
+    LivePlayerSession unchanged = store.get(PLAYER).orElseThrow();
+    assertEquals("server-a", unchanged.authoritativeServerId());
+    assertEquals(0, unchanged.playerSessionEpoch());
+    assertEquals(TRANSFER, unchanged.activeTransferId());
+    assertEquals(HandoffPhase.SNAPSHOT_STAGED, unchanged.handoffPhase());
+  }
+
+  @Test
+  void commitRejectsWrongPhase() {
+    LivePlayerSessionStore store = new LivePlayerSessionStore();
+    store.putActive(PLAYER, CLIENT, "server-a");
+    store.beginTransfer(PLAYER, 0, "server-a", TRANSFER);
+    store.markDestinationReady(PLAYER, 0, TRANSFER);
+
+    assertEquals(REJECTED_MISMATCH,
+        store.commit(PLAYER, 0, TRANSFER, "server-a", "server-b").status());
+    assertEquals(HandoffPhase.DESTINATION_READY,
+        store.get(PLAYER).orElseThrow().handoffPhase());
+  }
+
+  @Test
   void duplicatePhaseMessagesAreIdempotent() {
     LivePlayerSessionStore store = new LivePlayerSessionStore();
     store.putActive(PLAYER, CLIENT, "server-a");
@@ -109,6 +141,8 @@ public class LivePlayerSessionStoreTest {
     assertEquals(APPLIED, store.markSourceFrozen(PLAYER, 0, TRANSFER).status());
     assertEquals(ALREADY_APPLIED, store.markSourceFrozen(PLAYER, 0, TRANSFER).status());
     assertEquals(APPLIED, store.markSnapshotStaged(PLAYER, 0, TRANSFER).status());
+    assertEquals(ALREADY_APPLIED, store.markDestinationReady(PLAYER, 0, TRANSFER).status());
+    assertEquals(ALREADY_APPLIED, store.markSourceFrozen(PLAYER, 0, TRANSFER).status());
     assertEquals(ALREADY_APPLIED, store.markSnapshotStaged(PLAYER, 0, TRANSFER).status());
     assertEquals(APPLIED, store.commit(PLAYER, 0, TRANSFER, "server-a", "server-b").status());
     assertEquals(APPLIED, store.markActiveDestination(PLAYER, 1, TRANSFER).status());
@@ -197,16 +231,16 @@ public class LivePlayerSessionStoreTest {
 
   @Test
   void rereadsCommittedSessionForLostAckDuplicate() {
-    LivePlayerSessionStore store = new LivePlayerSessionStore();
-    store.putActive(PLAYER, CLIENT, "server-a");
-    store.beginTransfer(PLAYER, 0, "server-a", TRANSFER);
-    store.markDestinationReady(PLAYER, 0, TRANSFER);
-    store.markSourceFrozen(PLAYER, 0, TRANSFER);
-    store.markSnapshotStaged(PLAYER, 0, TRANSFER);
+    LivePlayerSessionStore store = stagedStore();
     store.commit(PLAYER, 0, TRANSFER, "server-a", "server-b");
 
-    assertEquals(ALREADY_APPLIED, store.commit(PLAYER, 0, TRANSFER,
-        "server-a", "server-b").status());
+    LivePlayerSessionStore.TransitionResult reread = store.commit(PLAYER, 0, TRANSFER,
+        "server-a", "server-b");
+
+    assertEquals(ALREADY_APPLIED, reread.status());
+    assertEquals("server-b", reread.after().orElseThrow().authoritativeServerId());
+    assertEquals(1, reread.after().orElseThrow().playerSessionEpoch());
+    assertEquals(HandoffPhase.COMMITTED, reread.after().orElseThrow().handoffPhase());
   }
 
   @Test
@@ -221,5 +255,15 @@ public class LivePlayerSessionStoreTest {
 
     assertEquals(REJECTED_STALE_EPOCH, store.beginTransfer(PLAYER, 0, "server-b",
         UUID.fromString("00000000-0000-0000-0000-000000000005")).status());
+  }
+
+  private static LivePlayerSessionStore stagedStore() {
+    LivePlayerSessionStore store = new LivePlayerSessionStore();
+    store.putActive(PLAYER, CLIENT, "server-a");
+    store.beginTransfer(PLAYER, 0, "server-a", TRANSFER);
+    store.markDestinationReady(PLAYER, 0, TRANSFER);
+    store.markSourceFrozen(PLAYER, 0, TRANSFER);
+    store.markSnapshotStaged(PLAYER, 0, TRANSFER);
+    return store;
   }
 }

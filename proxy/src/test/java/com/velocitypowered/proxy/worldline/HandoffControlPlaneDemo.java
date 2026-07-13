@@ -17,10 +17,11 @@
 
 package com.velocitypowered.proxy.worldline;
 
+import java.nio.file.Path;
 import java.util.UUID;
 
 /**
- * Scriptable placeholder prepare-abort round trip for M2.
+ * Scriptable prepare-abort round trip against the two Paper control endpoints.
  */
 public final class HandoffControlPlaneDemo {
 
@@ -30,29 +31,50 @@ public final class HandoffControlPlaneDemo {
   /**
    * Runs a prepare-abort round trip and exits non-zero on failure.
    */
-  public static void main(final String[] args) {
+  public static void main(final String[] args) throws Exception {
     UUID player = UUID.fromString("00000000-0000-0000-0000-000000000021");
     UUID client = UUID.fromString("00000000-0000-0000-0000-000000000022");
     UUID transfer = UUID.fromString("00000000-0000-0000-0000-000000000023");
 
-    LivePlayerSessionStore sessions = new LivePlayerSessionStore();
+    LivePlayerSessionStore sessions = new LivePlayerSessionStore((name, before, after) ->
+        System.out.printf("transition transfer_id=%s previous=%s next=%s epoch=%d%n",
+            before.activeTransferId() == null ? transfer : before.activeTransferId(),
+            before.handoffPhase(), after.handoffPhase(), after.playerSessionEpoch()));
     sessions.putActive(player, client, "server-a");
     HandoffControlPlane control = new HandoffControlPlane(sessions);
+    control.configure(StaticPartitionMap.read(Path.of(args[0])));
     ControlEnvelope envelope = new ControlEnvelope(HandoffControlPlane.PROTOCOL_VERSION, transfer,
-        player, "server-a", "server-b", "west", "east", 0, 0, 0, 0);
+        player, "server-a", "server-b", "west", "east", 1, 1, 0, 0);
 
+    System.out.printf("initial phase=%s authority=%s epoch=%d transfer=%s%n",
+        sessions.get(player).orElseThrow().handoffPhase(),
+        sessions.get(player).orElseThrow().authoritativeServerId(),
+        sessions.get(player).orElseThrow().playerSessionEpoch(),
+        sessions.get(player).orElseThrow().activeTransferId());
+    System.out.printf("prepare sent transfer_id=%s source=server-a destination=server-b%n",
+        transfer);
     require(LivePlayerSessionStore.Status.APPLIED, control.prepare(envelope).status(), "prepare");
     require(HandoffPhase.DESTINATION_READY, sessions.get(player).orElseThrow().handoffPhase(),
         "prepared phase");
+    System.out.println("destination acknowledgement received phase=DESTINATION_READY");
+    System.out.printf("abort requested transfer_id=%s%n", transfer);
     require(LivePlayerSessionStore.Status.APPLIED, control.abort(envelope).status(), "abort");
+    System.out.printf("abort sent and acknowledged transfer_id=%s%n", transfer);
     require(HandoffPhase.ACTIVE_SOURCE, sessions.get(player).orElseThrow().handoffPhase(),
         "aborted phase");
+    LivePlayerSession finalSession = sessions.get(player).orElseThrow();
+    require("server-a", finalSession.authoritativeServerId(), "authority");
+    require(0L, finalSession.playerSessionEpoch(), "epoch");
+    require(null, finalSession.activeTransferId(), "cleared transfer");
 
-    System.out.println("prepare-abort ok");
+    System.out.printf("final phase=%s authority=%s epoch=%d transfer=%s%n",
+        finalSession.handoffPhase(), finalSession.authoritativeServerId(),
+        finalSession.playerSessionEpoch(), finalSession.activeTransferId());
+    System.out.println("prepare-abort ok: authority unchanged, epoch unchanged, transfer cleared");
   }
 
   private static void require(final Object expected, final Object actual, final String label) {
-    if (!expected.equals(actual)) {
+    if (!java.util.Objects.equals(expected, actual)) {
       throw new IllegalStateException(label + ": expected " + expected + ", got " + actual);
     }
   }

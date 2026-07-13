@@ -90,37 +90,42 @@ public final class BoundaryCrossingDetector {
    * Movement routing decision.
    */
   public record Decision(Action action, Optional<String> sourcePartitionId,
-                         Optional<String> remotePartitionId, Optional<String> remoteOwner) {
+                         Optional<String> remotePartitionId, Optional<String> remoteOwner,
+                         long sourcePartitionEpoch, long remotePartitionEpoch) {
 
     static Decision forward() {
-      return new Decision(Action.FORWARD, Optional.empty(), Optional.empty(), Optional.empty());
+      return new Decision(Action.FORWARD, Optional.empty(), Optional.empty(), Optional.empty(),
+          0, 0);
     }
 
     static Decision prepare(final StaticPartitionMap.Partition source,
         final StaticPartitionMap.Partition remote) {
       return new Decision(Action.PREPARE, Optional.of(source.id()), Optional.of(remote.id()),
-          Optional.of(remote.owner()));
+          Optional.of(remote.owner()), source.epoch(), remote.epoch());
     }
 
     static Decision withholdCrossing(final StaticPartitionMap.Partition source,
         final StaticPartitionMap.Partition remote) {
       return new Decision(Action.WITHHOLD_CROSSING, Optional.of(source.id()),
-          Optional.of(remote.id()), Optional.of(remote.owner()));
+          Optional.of(remote.id()), Optional.of(remote.owner()), source.epoch(), remote.epoch());
     }
 
     static Decision bufferLimitExceeded(final Decision decision) {
       return new Decision(Action.BUFFER_LIMIT_EXCEEDED, decision.sourcePartitionId(),
-          decision.remotePartitionId(), decision.remoteOwner());
+          decision.remotePartitionId(), decision.remoteOwner(), decision.sourcePartitionEpoch(),
+          decision.remotePartitionEpoch());
     }
 
     static Decision prepareTimeout(final Decision decision) {
       return new Decision(Action.PREPARE_TIMEOUT, decision.sourcePartitionId(),
-          decision.remotePartitionId(), decision.remoteOwner());
+          decision.remotePartitionId(), decision.remoteOwner(), decision.sourcePartitionEpoch(),
+          decision.remotePartitionEpoch());
     }
 
     static Decision prepareNotReady(final Decision decision) {
       return new Decision(Action.PREPARE_NOT_READY, decision.sourcePartitionId(),
-          decision.remotePartitionId(), decision.remoteOwner());
+          decision.remotePartitionId(), decision.remoteOwner(), decision.sourcePartitionEpoch(),
+          decision.remotePartitionEpoch());
     }
   }
 
