@@ -38,6 +38,7 @@ import com.velocitypowered.proxy.protocol.packet.DisconnectPacket;
 import com.velocitypowered.proxy.protocol.packet.JoinGamePacket;
 import com.velocitypowered.proxy.protocol.packet.KeepAlivePacket;
 import com.velocitypowered.proxy.protocol.packet.PluginMessagePacket;
+import com.velocitypowered.proxy.protocol.packet.UpsertPlayerInfoPacket;
 import java.util.concurrent.CompletableFuture;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -136,6 +137,19 @@ public class TransitionSessionHandler implements MinecraftSessionHandler {
           if (!serverConn.isWorldlineResume()) {
             playHandler.handleBackendJoinGame(packet, serverConn);
           } else {
+            // The client-facing work in handleBackendJoinGame is skipped on purpose, but the
+            // proxy-side join bookkeeping must still happen or the connection stays half-open:
+            // hasCompletedJoin() gates future connection requests.
+            serverConn.setEntityId(packet.getEntityId());
+            serverConn.completeJoin();
+            // The client still holds the chat session it registered with the previous backend,
+            // and would signature-validate its own messages against it. The new backend never
+            // received that session and broadcasts the player's chat unsigned, so clear the
+            // client's remembered session or it reports a chat validation error.
+            final UpsertPlayerInfoPacket clearChatSession =
+                new UpsertPlayerInfoPacket(UpsertPlayerInfoPacket.Action.INITIALIZE_CHAT);
+            clearChatSession.addEntry(new UpsertPlayerInfoPacket.Entry(player.getUniqueId()));
+            player.getConnection().write(clearChatSession);
             logger.info("Worldline M1 spliced {} from {} to {} without a client transition",
                 player.getUsername(),
                 previousServer == null ? "initial" : previousServer.getServerInfo().getName(),

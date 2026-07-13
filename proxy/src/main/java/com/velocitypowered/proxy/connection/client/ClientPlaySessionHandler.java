@@ -66,6 +66,7 @@ import com.velocitypowered.proxy.protocol.packet.chat.keyed.KeyedPlayerCommandPa
 import com.velocitypowered.proxy.protocol.packet.chat.legacy.LegacyChatHandler;
 import com.velocitypowered.proxy.protocol.packet.chat.legacy.LegacyChatPacket;
 import com.velocitypowered.proxy.protocol.packet.chat.legacy.LegacyCommandHandler;
+import com.velocitypowered.proxy.protocol.packet.chat.session.ChatSessionUpdatePacket;
 import com.velocitypowered.proxy.protocol.packet.chat.session.SessionChatHandler;
 import com.velocitypowered.proxy.protocol.packet.chat.session.SessionCommandHandler;
 import com.velocitypowered.proxy.protocol.packet.chat.session.SessionPlayerChatPacket;
@@ -507,6 +508,21 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
         }, player.getConnection().eventLoop());
 
     return true;
+  }
+
+  @Override
+  public boolean handle(ChatSessionUpdatePacket packet) {
+    if (!System.getProperty("worldline.splice-target", "").isEmpty()) {
+      // With the splice armed, no backend may ever install the client's chat session: a backend
+      // holding the session broadcasts the player's chat signed, which advances the client's
+      // last-seen acknowledgement window, and the next backend after a splice would then kick the
+      // player for acknowledging messages it never sent. Dropping the session here keeps chat
+      // unsigned cluster-wide so acknowledgement state stays empty and consistent everywhere.
+      logger.info("Worldline dropped chat session update from {}; the slice runs unsigned chat",
+          player.getUsername());
+      return true;
+    }
+    return false;
   }
 
   @Override
