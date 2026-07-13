@@ -103,8 +103,10 @@ public class TransitionSessionHandler implements MinecraftSessionHandler {
       player.sendKeepAlive();
     }
 
-    // Reset Tablist header and footer to prevent desync
-    player.clearPlayerListHeaderAndFooter();
+    if (!serverConn.isWorldlineResume()) {
+      // Reset Tablist header and footer to prevent desync
+      player.clearPlayerListHeaderAndFooter();
+    }
 
     // Override online mode
     packet.setOnlineMode(player.isOnlineMode());
@@ -131,7 +133,14 @@ public class TransitionSessionHandler implements MinecraftSessionHandler {
             player.getConnection().setActiveSessionHandler(StateRegistry.PLAY, playHandler);
           }
           assert playHandler != null;
-          playHandler.handleBackendJoinGame(packet, serverConn);
+          if (!serverConn.isWorldlineResume()) {
+            playHandler.handleBackendJoinGame(packet, serverConn);
+          } else {
+            logger.info("Worldline M1 spliced {} from {} to {} without a client transition",
+                player.getUsername(),
+                previousServer == null ? "initial" : previousServer.getServerInfo().getName(),
+                serverConn.getServerInfo().getName());
+          }
 
           // Set the new play session handler for the server. We will have nothing more to do
           // with this connection once this task finishes up.

@@ -131,6 +131,12 @@ public class VelocityServerConnection implements MinecraftConnectionAssociation,
     return result;
   }
 
+  boolean isWorldlineResume() {
+    return previousServer != null
+        && registeredServer.getServerInfo().getName().equals(
+            System.getProperty("worldline.splice-target", ""));
+  }
+
   String getPlayerRemoteAddressAsString() {
     final String addr = proxyPlayer.getRemoteAddress().getAddress().getHostAddress();
     int ipv6ScopeIdx = addr.indexOf('%');
@@ -184,6 +190,11 @@ public class VelocityServerConnection implements MinecraftConnectionAssociation,
       handshake.setServerAddress(playerVhost + forgeConnection.getModernToken());
     } else {
       handshake.setServerAddress(playerVhost);
+    }
+    if (isWorldlineResume() && proxyPlayer.getConnectedServer() != null
+        && proxyPlayer.getConnectedServer().getEntityId() != null) {
+      handshake.setServerAddress(handshake.getServerAddress() + ".worldline-resume-"
+          + proxyPlayer.getConnectedServer().getEntityId());
     }
 
     handshake.setPort(proxyPlayer.getVirtualHost()

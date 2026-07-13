@@ -88,6 +88,7 @@ import com.velocitypowered.proxy.protocol.packet.ServerLoginPacket;
 import com.velocitypowered.proxy.protocol.packet.ServerLoginSuccessPacket;
 import com.velocitypowered.proxy.protocol.packet.ServerboundCookieResponsePacket;
 import com.velocitypowered.proxy.protocol.packet.ServerboundCustomClickActionPacket;
+import com.velocitypowered.proxy.protocol.packet.ServerboundMovePlayerPacket;
 import com.velocitypowered.proxy.protocol.packet.SetCompressionPacket;
 import com.velocitypowered.proxy.protocol.packet.StatusPingPacket;
 import com.velocitypowered.proxy.protocol.packet.StatusRequestPacket;
@@ -411,6 +412,22 @@ public enum StateRegistry {
           map(0x0E, MINECRAFT_1_21_2, false),
           map(0x0F, MINECRAFT_1_21_6, false),
           map(0x10, MINECRAFT_26_1, false));
+      serverbound.register(
+          ServerboundMovePlayerPacket.Position.class,
+          ServerboundMovePlayerPacket.Position::new,
+          map(0x1E, MINECRAFT_26_1, false));
+      serverbound.register(
+          ServerboundMovePlayerPacket.PositionRotation.class,
+          ServerboundMovePlayerPacket.PositionRotation::new,
+          map(0x1F, MINECRAFT_26_1, false));
+      serverbound.register(
+          ServerboundMovePlayerPacket.Rotation.class,
+          ServerboundMovePlayerPacket.Rotation::new,
+          map(0x20, MINECRAFT_26_1, false));
+      serverbound.register(
+          ServerboundMovePlayerPacket.StatusOnly.class,
+          ServerboundMovePlayerPacket.StatusOnly::new,
+          map(0x21, MINECRAFT_26_1, false));
 
       clientbound.register(
           BossBarPacket.class,

@@ -163,7 +163,12 @@ public class LoginSessionHandler implements MinecraftSessionHandler {
       if (player.getClientSettingsPacket() != null) {
         smc.write(player.getClientSettingsPacket());
       }
-      if (player.getConnection().getActiveSessionHandler() instanceof ClientPlaySessionHandler clientPlaySessionHandler) {
+      if (serverConn.isWorldlineResume()) {
+        // ponytail: M1 drives backend configuration silently; the harness guarantees parity.
+        logger.info("Worldline M1 preparing silent splice for {} to {}",
+            player.getUsername(), serverConn.getServerInfo().getName());
+        smc.setAutoReading(true);
+      } else if (player.getConnection().getActiveSessionHandler() instanceof ClientPlaySessionHandler clientPlaySessionHandler) {
         smc.setAutoReading(false);
         clientPlaySessionHandler.doSwitch().thenRunAsync(() -> smc.setAutoReading(true), smc.eventLoop());
       } else {

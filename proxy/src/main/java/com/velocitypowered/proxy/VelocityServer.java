@@ -69,6 +69,10 @@ import com.velocitypowered.proxy.util.ResourceUtils;
 import com.velocitypowered.proxy.util.VelocityChannelRegistrar;
 import com.velocitypowered.proxy.util.ratelimit.Ratelimiter;
 import com.velocitypowered.proxy.util.ratelimit.Ratelimiters;
+import com.velocitypowered.proxy.worldline.BoundaryCrossingDetector;
+import com.velocitypowered.proxy.worldline.HandoffControlPlane;
+import com.velocitypowered.proxy.worldline.LivePlayerSessionStore;
+import com.velocitypowered.proxy.worldline.StaticPartitionMap;
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import io.netty.bootstrap.Bootstrap;
 import io.netty.channel.Channel;
@@ -175,6 +179,10 @@ public class VelocityServer implements ProxyServer, ForwardingAudience {
   private final VelocityScheduler scheduler;
   private final VelocityChannelRegistrar channelRegistrar = new VelocityChannelRegistrar();
   private final ServerListPingHandler serverListPingHandler;
+  private final LivePlayerSessionStore worldlineLiveSessions = new LivePlayerSessionStore();
+  private final HandoffControlPlane worldlineControlPlane =
+      new HandoffControlPlane(worldlineLiveSessions);
+  private Optional<BoundaryCrossingDetector> worldlineBoundaryDetector = Optional.empty();
 
   VelocityServer(final ProxyOptions options) {
     pluginManager = new VelocityPluginManager(this);
@@ -413,11 +421,53 @@ public class VelocityServer implements ProxyServer, ForwardingAudience {
       }
 
       commandManager.setAnnounceProxyCommands(configuration.isAnnounceProxyCommands());
+      loadWorldlineConfig();
     } catch (Exception e) {
       logger.error("Unable to read/load/save your velocity.toml. The server will shut down.", e);
       LogManager.shutdown();
       System.exit(1);
     }
+  }
+
+  private void loadWorldlineConfig() {
+    String config = System.getProperty("worldline.config", "");
+    if (config.isBlank()) {
+      return;
+    }
+    Path path = Path.of(config);
+    if (!Files.exists(path)) {
+      logger.warn("Worldline config {} does not exist; boundary detection disabled", path);
+      return;
+    }
+    try {
+      StaticPartitionMap partitionMap = StaticPartitionMap.read(path);
+      worldlineBoundaryDetector = Optional.of(new BoundaryCrossingDetector(partitionMap,
+          partitionMap.levelName(), partitionMap.dimension(), 1));
+      logger.info("Loaded Worldline boundary config from {}", path);
+    } catch (IOException e) {
+      logger.error("Unable to load Worldline config {}; boundary detection disabled", path, e);
+    }
+  }
+
+  /**
+   * Returns the optional Worldline boundary detector for the vertical slice.
+   */
+  public Optional<BoundaryCrossingDetector> getWorldlineBoundaryDetector() {
+    return worldlineBoundaryDetector;
+  }
+
+  /**
+   * Returns the Worldline live player-session table for the vertical slice.
+   */
+  public LivePlayerSessionStore getWorldlineLiveSessions() {
+    return worldlineLiveSessions;
+  }
+
+  /**
+   * Returns the Worldline handoff control plane for the vertical slice.
+   */
+  public HandoffControlPlane getWorldlineControlPlane() {
+    return worldlineControlPlane;
   }
 
   private void loadPlugins() {

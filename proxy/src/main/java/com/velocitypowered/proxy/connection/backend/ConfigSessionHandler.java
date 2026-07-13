@@ -49,11 +49,13 @@ import com.velocitypowered.proxy.protocol.packet.PluginMessagePacket;
 import com.velocitypowered.proxy.protocol.packet.RemoveResourcePackPacket;
 import com.velocitypowered.proxy.protocol.packet.ResourcePackRequestPacket;
 import com.velocitypowered.proxy.protocol.packet.ResourcePackResponsePacket;
+import com.velocitypowered.proxy.protocol.packet.ServerboundCookieResponsePacket;
 import com.velocitypowered.proxy.protocol.packet.TransferPacket;
 import com.velocitypowered.proxy.protocol.packet.config.ClientboundCustomReportDetailsPacket;
 import com.velocitypowered.proxy.protocol.packet.config.ClientboundServerLinksPacket;
 import com.velocitypowered.proxy.protocol.packet.config.CodeOfConductPacket;
 import com.velocitypowered.proxy.protocol.packet.config.FinishedUpdatePacket;
+import com.velocitypowered.proxy.protocol.packet.config.KnownPacksPacket;
 import com.velocitypowered.proxy.protocol.packet.config.RegistrySyncPacket;
 import com.velocitypowered.proxy.protocol.packet.config.StartUpdatePacket;
 import com.velocitypowered.proxy.protocol.packet.config.TagsUpdatePacket;
@@ -126,31 +128,55 @@ public class ConfigSessionHandler implements MinecraftSessionHandler {
 
   @Override
   public boolean handle(TagsUpdatePacket packet) {
-    serverConn.getPlayer().getConnection().write(packet);
+    if (!serverConn.isWorldlineResume()) {
+      serverConn.getPlayer().getConnection().write(packet);
+    }
     return true;
   }
 
   @Override
   public boolean handle(ClientboundCustomReportDetailsPacket packet) {
-    serverConn.getPlayer().getConnection().write(packet);
+    if (!serverConn.isWorldlineResume()) {
+      serverConn.getPlayer().getConnection().write(packet);
+    }
     return true;
   }
 
   @Override
   public boolean handle(ClientboundServerLinksPacket packet) {
-    serverConn.getPlayer().getConnection().write(packet);
+    if (!serverConn.isWorldlineResume()) {
+      serverConn.getPlayer().getConnection().write(packet);
+    }
     return true;
   }
 
   @Override
   public boolean handle(KeepAlivePacket packet) {
+    if (serverConn.isWorldlineResume()) {
+      serverConn.ensureConnected().write(packet);
+      return true;
+    }
     serverConn.getPendingPings().put(packet.getRandomId(), System.nanoTime());
     serverConn.getPlayer().getConnection().write(packet);
     return true;
   }
 
   @Override
+  public boolean handle(KnownPacksPacket packet) {
+    if (serverConn.isWorldlineResume()) {
+      serverConn.ensureConnected().write(packet);
+      return true;
+    }
+    return false;
+  }
+
+  @Override
   public boolean handle(final ResourcePackRequestPacket packet) {
+    if (serverConn.isWorldlineResume()) {
+      serverConn.ensureConnected().write(new ResourcePackResponsePacket(
+          packet.getId(), packet.getHash(), PlayerResourcePackStatusEvent.Status.DECLINED));
+      return true;
+    }
     final MinecraftConnection playerConnection = serverConn.getPlayer().getConnection();
 
     final ResourcePackInfo resourcePackInfo = packet.toServerPromptedPack();
@@ -206,6 +232,9 @@ public class ConfigSessionHandler implements MinecraftSessionHandler {
 
   @Override
   public boolean handle(RemoveResourcePackPacket packet) {
+    if (serverConn.isWorldlineResume()) {
+      return true;
+    }
     final MinecraftConnection playerConnection = this.serverConn.getPlayer().getConnection();
 
     final ServerResourcePackRemoveEvent event = new ServerResourcePackRemoveEvent(
@@ -235,10 +264,15 @@ public class ConfigSessionHandler implements MinecraftSessionHandler {
   public boolean handle(FinishedUpdatePacket packet) {
     final MinecraftConnection smc = serverConn.ensureConnected();
     final ConnectedPlayer player = serverConn.getPlayer();
-    final ClientConfigSessionHandler configHandler = (ClientConfigSessionHandler) player.getConnection().getActiveSessionHandler();
-
     smc.getChannel().pipeline().get(MinecraftVarintFrameDecoder.class).setState(StateRegistry.PLAY);
     smc.getChannel().pipeline().get(MinecraftDecoder.class).setState(StateRegistry.PLAY);
+    if (serverConn.isWorldlineResume()) {
+      smc.write(FinishedUpdatePacket.INSTANCE);
+      smc.setActiveSessionHandler(StateRegistry.PLAY,
+          new TransitionSessionHandler(server, serverConn, resultFuture));
+      return true;
+    }
+    final ClientConfigSessionHandler configHandler = (ClientConfigSessionHandler) player.getConnection().getActiveSessionHandler();
     //noinspection DataFlowIssue
     configHandler.handleBackendFinishUpdate(serverConn).thenRunAsync(() -> {
       smc.write(FinishedUpdatePacket.INSTANCE);
@@ -272,6 +306,9 @@ public class ConfigSessionHandler implements MinecraftSessionHandler {
 
   @Override
   public boolean handle(PluginMessagePacket packet) {
+    if (serverConn.isWorldlineResume()) {
+      return true;
+    }
     if (PluginMessageUtil.isMcBrand(packet)) {
       serverConn.getPlayer().getConnection().write(
           PluginMessageUtil.rewriteMinecraftBrand(packet, server.getVersion(),
@@ -306,12 +343,17 @@ public class ConfigSessionHandler implements MinecraftSessionHandler {
 
   @Override
   public boolean handle(RegistrySyncPacket packet) {
-    serverConn.getPlayer().getConnection().write(packet.retain());
+    if (!serverConn.isWorldlineResume()) {
+      serverConn.getPlayer().getConnection().write(packet.retain());
+    }
     return true;
   }
 
   @Override
   public boolean handle(TransferPacket packet) {
+    if (serverConn.isWorldlineResume()) {
+      return true;
+    }
     final InetSocketAddress originalAddress = packet.address();
     if (originalAddress == null) {
       logger.error("""
@@ -336,6 +378,9 @@ public class ConfigSessionHandler implements MinecraftSessionHandler {
 
   @Override
   public boolean handle(ClientboundStoreCookiePacket packet) {
+    if (serverConn.isWorldlineResume()) {
+      return true;
+    }
     server.getEventManager()
         .fire(new CookieStoreEvent(serverConn.getPlayer(), packet.getKey(), packet.getPayload()))
         .thenAcceptAsync(event -> {
@@ -355,6 +400,11 @@ public class ConfigSessionHandler implements MinecraftSessionHandler {
 
   @Override
   public boolean handle(ClientboundCookieRequestPacket packet) {
+    if (serverConn.isWorldlineResume()) {
+      serverConn.ensureConnected().write(
+          new ServerboundCookieResponsePacket(packet.getKey(), null));
+      return true;
+    }
     server.getEventManager().fire(new CookieRequestEvent(serverConn.getPlayer(), packet.getKey()))
         .thenAcceptAsync(event -> {
           if (event.getResult().isAllowed()) {
@@ -370,7 +420,9 @@ public class ConfigSessionHandler implements MinecraftSessionHandler {
 
   @Override
   public boolean handle(CodeOfConductPacket packet) {
-    this.serverConn.getPlayer().getConnection().write(packet.retain());
+    if (!serverConn.isWorldlineResume()) {
+      this.serverConn.getPlayer().getConnection().write(packet.retain());
+    }
     return true;
   }
 
@@ -382,7 +434,9 @@ public class ConfigSessionHandler implements MinecraftSessionHandler {
 
   @Override
   public void handleGeneric(MinecraftPacket packet) {
-    serverConn.getPlayer().getConnection().write(packet);
+    if (!serverConn.isWorldlineResume()) {
+      serverConn.getPlayer().getConnection().write(packet);
+    }
   }
 
   @Override
