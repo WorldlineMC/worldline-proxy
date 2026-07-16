@@ -141,6 +141,9 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
   private @Nullable ControlEnvelope worldlineEnvelope;
   private @Nullable CompletableFuture<LivePlayerSessionStore.TransitionResult>
       worldlinePrepareFuture;
+  private @Nullable CompletableFuture<LivePlayerSessionStore.TransitionResult>
+      worldlineStageFuture;
+  private boolean worldlineFreezeInProgress;
 
   private CompletableFuture<Void> configSwitchFuture;
 
@@ -249,6 +252,9 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
   @Override
   public boolean handle(ClientSettingsPacket packet) {
     player.setClientSettings(packet);
+    if (worldlineSourceFrozen()) {
+      return true;
+    }
     VelocityServerConnection serverConnection = player.getConnectedServer();
     if (serverConnection == null) {
       // No server connection yet, probably transitioning.
@@ -260,6 +266,9 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
 
   @Override
   public boolean handle(SessionPlayerCommandPacket packet) {
+    if (abortFrozenGameplayInput()) {
+      return true;
+    }
     if (player.getCurrentServer().isEmpty()) {
       return true;
     }
@@ -277,6 +286,9 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
 
   @Override
   public boolean handle(SessionPlayerChatPacket packet) {
+    if (abortFrozenGameplayInput()) {
+      return true;
+    }
     if (player.getCurrentServer().isEmpty()) {
       return true;
     }
@@ -294,6 +306,9 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
 
   @Override
   public boolean handle(KeyedPlayerCommandPacket packet) {
+    if (abortFrozenGameplayInput()) {
+      return true;
+    }
     if (player.getCurrentServer().isEmpty()) {
       return true;
     }
@@ -311,6 +326,9 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
 
   @Override
   public boolean handle(KeyedPlayerChatPacket packet) {
+    if (abortFrozenGameplayInput()) {
+      return true;
+    }
     if (player.getCurrentServer().isEmpty()) {
       return true;
     }
@@ -328,6 +346,9 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
 
   @Override
   public boolean handle(LegacyChatPacket packet) {
+    if (abortFrozenGameplayInput()) {
+      return true;
+    }
     if (player.getCurrentServer().isEmpty()) {
       return true;
     }
@@ -358,6 +379,9 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
 
   @Override
   public boolean handle(PluginMessagePacket packet) {
+    if (abortFrozenGameplayInput()) {
+      return true;
+    }
     // Handling edge case when packet with FML client handshake (state COMPLETE)
     // arrives after JoinGame packet from destination server
     VelocityServerConnection serverConn =
@@ -553,6 +577,9 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
       if (worldlineMovementRouter.bufferedPackets().size() == 1) {
         logWorldlineCrossingWithheld(serverId, decision);
       }
+      if (worldlinePrepareFuture == null && worldlineEnvelope != null) {
+        beginWorldlineSnapshotStage(worldlineEnvelope);
+      }
       return true;
     }
     if (decision.action() == BoundaryCrossingDetector.Action.BUFFER_LIMIT_EXCEEDED
@@ -622,6 +649,9 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
         worldlineMovementRouter.markDestinationReady();
         logger.info("Worldline destination ready for {} from {} to {}", player, serverId,
             destinationServerId);
+        if (worldlineMovementRouter.hasBufferedInput()) {
+          beginWorldlineSnapshotStage(envelope);
+        }
         return;
       }
       worldlineTransferId = null;
@@ -636,6 +666,47 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
     }, player.getConnection().eventLoop());
   }
 
+  private void beginWorldlineSnapshotStage(final ControlEnvelope envelope) {
+    if (worldlineStageFuture != null) {
+      return;
+    }
+    CompletableFuture<LivePlayerSessionStore.TransitionResult> future = new CompletableFuture<>();
+    worldlineStageFuture = future;
+    worldlineFreezeInProgress = true;
+    Thread.startVirtualThread(() -> {
+      try {
+        HandoffControlPlane.SnapshotResult frozen =
+            server.getWorldlineControlPlane().freezeSource(envelope);
+        LivePlayerSessionStore.TransitionResult result = frozen.transition();
+        if (result.status() != LivePlayerSessionStore.Status.APPLIED
+            && result.status() != LivePlayerSessionStore.Status.ALREADY_APPLIED) {
+          future.complete(result);
+          return;
+        }
+        future.complete(server.getWorldlineControlPlane().stageSnapshot(envelope,
+            frozen.snapshot()));
+      } catch (Throwable throwable) {
+        future.completeExceptionally(throwable);
+      }
+    });
+    future.whenCompleteAsync((result, failure) -> {
+      if (worldlineStageFuture != future || worldlineEnvelope != envelope) {
+        return;
+      }
+      worldlineStageFuture = null;
+      worldlineFreezeInProgress = false;
+      if (failure == null && (result.status() == LivePlayerSessionStore.Status.APPLIED
+          || result.status() == LivePlayerSessionStore.Status.ALREADY_APPLIED)) {
+        logger.info("Worldline staged snapshot for {} transfer {}; awaiting M5 commit",
+            player, envelope.transferId());
+        return;
+      }
+      abortWorldlineHandoff(true);
+      logger.warn("Worldline snapshot staging failed for {} transfer {}: {}", player,
+          envelope.transferId(), failure == null ? result.status() : failure.getMessage());
+    }, player.getConnection().eventLoop());
+  }
+
   private void abortWorldlineHandoff() {
     abortWorldlineHandoff(false);
   }
@@ -644,9 +715,13 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
     final ControlEnvelope envelope = worldlineEnvelope;
     final CompletableFuture<LivePlayerSessionStore.TransitionResult> prepareFuture =
         worldlinePrepareFuture;
+    final CompletableFuture<LivePlayerSessionStore.TransitionResult> stageFuture =
+        worldlineStageFuture;
     worldlineTransferId = null;
     worldlineEnvelope = null;
     worldlinePrepareFuture = null;
+    worldlineStageFuture = null;
+    worldlineFreezeInProgress = false;
     if (worldlineMovementRouter != null) {
       if (blockCrossing) {
         worldlineMovementRouter.blockCrossing();
@@ -667,11 +742,13 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
             envelope.transferId(), result.status());
       }
     };
-    if (prepareFuture == null) {
+    CompletableFuture<LivePlayerSessionStore.TransitionResult> pending =
+        stageFuture != null ? stageFuture : prepareFuture;
+    if (pending == null) {
       Thread.startVirtualThread(abort);
     } else {
-      // Preserve command order so a late PREPARE cannot recreate state after ABORT.
-      prepareFuture.whenComplete((ignored, failure) -> Thread.startVirtualThread(abort));
+      // Preserve command order so a late prepare or stage cannot recreate state after abort.
+      pending.whenComplete((ignored, failure) -> Thread.startVirtualThread(abort));
     }
   }
 
@@ -682,7 +759,7 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
         player.getUniqueId(), sourceServerId, destinationServerId,
         decision.sourcePartitionId().orElse("unknown"),
         decision.remotePartitionId().orElse("unknown"), decision.sourcePartitionEpoch(),
-        decision.remotePartitionEpoch(), session.playerSessionEpoch(), 0);
+        decision.remotePartitionEpoch(), session.playerSessionEpoch(), 1);
   }
 
   private void logWorldlineCrossingWithheld(final String serverId,
@@ -693,6 +770,12 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
 
   @Override
   public void handleGeneric(MinecraftPacket packet) {
+    if (worldlineSourceFrozen()) {
+      abortWorldlineHandoff(true);
+      logger.warn("Worldline aborted frozen transfer for {} on unclassified gameplay packet {}",
+          player, packet.getClass().getSimpleName());
+      return;
+    }
     VelocityServerConnection serverConnection = player.getConnectedServer();
     if (serverConnection == null) {
       // No server connection yet, probably transitioning.
@@ -714,6 +797,11 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
 
   @Override
   public void handleUnknown(ByteBuf buf) {
+    if (worldlineSourceFrozen()) {
+      abortWorldlineHandoff(true);
+      logger.warn("Worldline aborted frozen transfer for {} on unknown gameplay packet", player);
+      return;
+    }
     VelocityServerConnection serverConnection = player.getConnectedServer();
     if (serverConnection == null) {
       // No server connection yet, probably transitioning.
@@ -728,6 +816,29 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
     if (stateAllowsForward) {
       smc.write(buf.retain());
     }
+  }
+
+  private boolean worldlineSourceFrozen() {
+    if (worldlineFreezeInProgress) {
+      return true;
+    }
+    if (worldlineTransferId == null) {
+      return false;
+    }
+    return server.getWorldlineLiveSessions().get(player.getUniqueId())
+        .map(session -> session.handoffPhase() == com.velocitypowered.proxy.worldline.HandoffPhase.SOURCE_FROZEN
+            || session.handoffPhase() == com.velocitypowered.proxy.worldline.HandoffPhase.SNAPSHOT_STAGED)
+        .orElse(false);
+  }
+
+  private boolean abortFrozenGameplayInput() {
+    if (!worldlineSourceFrozen()) {
+      return false;
+    }
+    abortWorldlineHandoff(true);
+    logger.warn("Worldline aborted frozen transfer for {} on non-replayable gameplay input",
+        player);
+    return true;
   }
 
   @Override

@@ -33,6 +33,7 @@ import org.checkerframework.checker.nullness.qual.Nullable;
 public final class WorldlineControlTransport {
 
   static final int MAGIC = 0x574c4d32;
+  static final int MAX_PAYLOAD_BYTES = 1_048_576;
   private static final int TIMEOUT_MILLIS = 2_000;
 
   private final StaticPartitionMap partitions;
@@ -44,16 +45,26 @@ public final class WorldlineControlTransport {
   /**
    * Sends one idempotent command and validates the server's fenced acknowledgement.
    */
-  public void send(final String serverId, final String command,
+  public byte[] send(final String serverId, final String command,
       final ControlEnvelope envelope) throws IOException {
-    send(serverId, command, envelope, null);
+    return send(serverId, command, envelope, null, new byte[0]);
   }
 
   /**
    * Sends one idempotent command with an optional destination preparation target.
    */
-  public void send(final String serverId, final String command,
+  public byte[] send(final String serverId, final String command,
       final ControlEnvelope envelope, final @Nullable PrepareTarget target) throws IOException {
+    return send(serverId, command, envelope, target, new byte[0]);
+  }
+
+  /** Sends one idempotent command with an optional target and bounded binary payload. */
+  public byte[] send(final String serverId, final String command,
+      final ControlEnvelope envelope, final @Nullable PrepareTarget target,
+      final byte[] payload) throws IOException {
+    if (payload.length > MAX_PAYLOAD_BYTES) {
+      throw new IOException("Worldline control payload exceeds " + MAX_PAYLOAD_BYTES + " bytes");
+    }
     InetSocketAddress address = partitions.controlAddress(serverId)
         .orElseThrow(() -> new IOException("No control endpoint for " + serverId));
     try (Socket socket = new Socket()) {
@@ -84,6 +95,8 @@ public final class WorldlineControlTransport {
         output.writeDouble(target.z());
         output.writeInt(target.visibilityRadiusChunks());
       }
+      output.writeInt(payload.length);
+      output.write(payload);
       output.flush();
 
       DataInputStream input = new DataInputStream(socket.getInputStream());
@@ -92,6 +105,14 @@ public final class WorldlineControlTransport {
       }
       boolean accepted = input.readBoolean();
       String detail = input.readUTF();
+      int responsePayloadLength = input.readInt();
+      if (responsePayloadLength < 0 || responsePayloadLength > MAX_PAYLOAD_BYTES) {
+        throw new IOException("Invalid Worldline control response payload from " + serverId);
+      }
+      byte[] responsePayload = input.readNBytes(responsePayloadLength);
+      if (responsePayload.length != responsePayloadLength) {
+        throw new IOException("Truncated Worldline control response payload from " + serverId);
+      }
       ControlEnvelope responseEnvelope = new ControlEnvelope(input.readInt(), readUuid(input),
           readUuid(input), input.readUTF(), input.readUTF(), input.readUTF(), input.readUTF(),
           input.readLong(), input.readLong(), input.readLong(), input.readLong());
@@ -105,7 +126,8 @@ public final class WorldlineControlTransport {
         throw new IOException("Mismatched Worldline control acknowledgement from " + serverId);
       }
       boolean sourceCommand = command.equals("CHECK_PREPARE")
-          || command.equals("FREEZE_SOURCE") || command.equals("CLEAN_SOURCE");
+          || command.equals("FREEZE_SOURCE") || command.equals("ABORT_SOURCE")
+          || command.equals("CLEAN_SOURCE");
       String expectedPartition = sourceCommand
           ? envelope.sourcePartitionId() : envelope.destinationPartitionId();
       long expectedEpoch = sourceCommand
@@ -113,6 +135,7 @@ public final class WorldlineControlTransport {
       if (!responsePartition.equals(expectedPartition) || responseEpoch != expectedEpoch) {
         throw new IOException("Stale Worldline ownership acknowledgement from " + serverId);
       }
+      return responsePayload;
     }
   }
 

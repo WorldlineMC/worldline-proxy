@@ -118,6 +118,18 @@ tasks {
         mainClass.set("com.velocitypowered.proxy.worldline.HandoffControlPlaneDemo")
         args(rootProject.layout.projectDirectory.dir("../harness/worldline.toml").asFile)
     }
+    register<JavaExec>("runM4FreezeStageAbort") {
+        dependsOn(testClasses)
+        classpath = sourceSets.test.get().runtimeClasspath
+        mainClass.set("com.velocitypowered.proxy.worldline.HandoffFreezeStageAbortDemo")
+        args(rootProject.layout.projectDirectory.dir("../harness/worldline.toml").asFile)
+        doFirst {
+            args(
+                providers.gradleProperty("worldlinePlayerUuid").get(),
+                providers.gradleProperty("worldlinePlayerName").getOrElse("WorldlineDemo"),
+            )
+        }
+    }
 }
 
 val projectVersion = version as String

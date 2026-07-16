@@ -31,7 +31,7 @@ import org.checkerframework.checker.nullness.qual.Nullable;
  */
 public final class HandoffControlPlane {
 
-  public static final int PROTOCOL_VERSION = 2;
+  public static final int PROTOCOL_VERSION = 3;
   private static final Logger logger = LogManager.getLogger(HandoffControlPlane.class);
 
   private final LivePlayerSessionStore sessions;
@@ -108,6 +108,9 @@ public final class HandoffControlPlane {
     if (ownership != null) {
       return ownership;
     }
+    if (send(envelope.sourceServerId(), "ABORT_SOURCE", envelope, null, new byte[0]) == null) {
+      return sessions.controlUnavailable(envelope.playerUuid());
+    }
     LivePlayerSessionStore.TransitionResult result = transition(HandoffPhase.ACTIVE_SOURCE,
         envelope,
         () -> sessions.abortTransfer(envelope.playerUuid(), envelope.playerSessionEpoch(),
@@ -119,27 +122,37 @@ public final class HandoffControlPlane {
   /**
    * Records that the source froze the player at the transfer boundary.
    */
-  public LivePlayerSessionStore.TransitionResult freezeSource(final ControlEnvelope envelope) {
+  public SnapshotResult freezeSource(final ControlEnvelope envelope) {
     validateProtocol(envelope);
-    LivePlayerSessionStore.TransitionResult rejection = beforeServerCommand(
-        envelope.sourceServerId(), "FREEZE_SOURCE", envelope);
-    if (rejection != null) {
-      return rejection;
+    LivePlayerSessionStore.TransitionResult ownership = validateOwnership(envelope);
+    if (ownership != null) {
+      return new SnapshotResult(ownership, new byte[0]);
     }
-    return transition(HandoffPhase.SOURCE_FROZEN, envelope,
+    byte[] snapshot = send(envelope.sourceServerId(), "FREEZE_SOURCE", envelope,
+        null, new byte[0]);
+    if (snapshot == null) {
+      return new SnapshotResult(sessions.controlUnavailable(envelope.playerUuid()), new byte[0]);
+    }
+    LivePlayerSessionStore.TransitionResult result = transition(HandoffPhase.SOURCE_FROZEN,
+        envelope,
         () -> sessions.markSourceFrozen(envelope.playerUuid(), envelope.playerSessionEpoch(),
             envelope.transferId()));
+    return new SnapshotResult(result, snapshot);
   }
 
   /**
    * Records that the destination staged the source snapshot.
    */
-  public LivePlayerSessionStore.TransitionResult stageSnapshot(final ControlEnvelope envelope) {
+  public LivePlayerSessionStore.TransitionResult stageSnapshot(final ControlEnvelope envelope,
+      final byte[] snapshot) {
     validateProtocol(envelope);
-    LivePlayerSessionStore.TransitionResult rejection = beforeServerCommand(
-        envelope.destinationServerId(), "STAGE_SNAPSHOT", envelope);
-    if (rejection != null) {
-      return rejection;
+    LivePlayerSessionStore.TransitionResult ownership = validateOwnership(envelope);
+    if (ownership != null) {
+      return ownership;
+    }
+    if (send(envelope.destinationServerId(), "STAGE_SNAPSHOT", envelope,
+        null, snapshot) == null) {
+      return sessions.controlUnavailable(envelope.playerUuid());
     }
     return transition(HandoffPhase.SNAPSHOT_STAGED, envelope,
         () -> sessions.markSnapshotStaged(envelope.playerUuid(), envelope.playerSessionEpoch(),
@@ -285,17 +298,22 @@ public final class HandoffControlPlane {
 
   private boolean send(final String serverId, final String command,
       final ControlEnvelope envelope, final @Nullable PrepareTarget target) {
+    return send(serverId, command, envelope, target, new byte[0]) != null;
+  }
+
+  private @Nullable byte[] send(final String serverId, final String command,
+      final ControlEnvelope envelope, final @Nullable PrepareTarget target,
+      final byte[] payload) {
     WorldlineControlTransport current = transport;
     if (current == null) {
-      return true;
+      return new byte[0];
     }
     try {
-      current.send(serverId, command, envelope, target);
-      return true;
+      return current.send(serverId, command, envelope, target, payload);
     } catch (IOException e) {
       logger.warn("Worldline control command {} transfer={} server={} failed: {}", command,
           envelope.transferId(), serverId, e.getMessage());
-      return false;
+      return null;
     }
   }
 
@@ -310,6 +328,19 @@ public final class HandoffControlPlane {
     if (envelope.protocolVersion() != PROTOCOL_VERSION) {
       throw new IllegalArgumentException("Unsupported Worldline control protocol "
           + envelope.protocolVersion());
+    }
+  }
+
+  /** Result of freezing source authority and capturing its exact player snapshot. */
+  public record SnapshotResult(LivePlayerSessionStore.TransitionResult transition,
+                               byte[] snapshot) {
+    public SnapshotResult {
+      snapshot = snapshot.clone();
+    }
+
+    @Override
+    public byte[] snapshot() {
+      return snapshot.clone();
     }
   }
 }

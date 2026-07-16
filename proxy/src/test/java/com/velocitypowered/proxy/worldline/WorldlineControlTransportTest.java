@@ -69,6 +69,24 @@ public class WorldlineControlTransportTest {
   }
 
   @Test
+  void carriesBoundedRequestAndResponsePayloads() throws Exception {
+    try (FakeControlServer server = new FakeControlServer(1, Response.VALID_PAYLOAD)) {
+      byte[] response = transport(server.port()).send("server-b", "STAGE_SNAPSHOT", envelope(),
+          null, new byte[]{1, 2, 3});
+
+      assertEquals(List.of(List.of((byte) 1, (byte) 2, (byte) 3)), server.payloads());
+      assertEquals(List.of((byte) 4, (byte) 5, (byte) 6), boxed(response));
+    }
+  }
+
+  @Test
+  void rejectsOversizedPayloadBeforeConnecting() throws Exception {
+    byte[] oversized = new byte[WorldlineControlTransport.MAX_PAYLOAD_BYTES + 1];
+    assertThrows(IOException.class, () -> transport(1).send("server-b", "STAGE_SNAPSHOT",
+        envelope(), null, oversized));
+  }
+
+  @Test
   void rejectsMismatchedAcknowledgement() throws Exception {
     try (FakeControlServer server = new FakeControlServer(1, Response.WRONG_TRANSFER)) {
       assertThrows(IOException.class,
@@ -120,6 +138,7 @@ public class WorldlineControlTransportTest {
 
   private enum Response {
     VALID,
+    VALID_PAYLOAD,
     WRONG_TRANSFER,
     MALFORMED
   }
@@ -130,6 +149,7 @@ public class WorldlineControlTransportTest {
     private final List<String> commands = new ArrayList<>();
     private final List<ControlEnvelope> envelopes = new ArrayList<>();
     private final List<PrepareTarget> targets = new ArrayList<>();
+    private final List<List<Byte>> payloads = new ArrayList<>();
     private final Thread thread;
     private volatile Throwable failure;
 
@@ -153,6 +173,10 @@ public class WorldlineControlTransportTest {
 
     List<PrepareTarget> targets() {
       return List.copyOf(targets);
+    }
+
+    List<List<Byte>> payloads() {
+      return List.copyOf(payloads);
     }
 
     private void serve(final int requestCount, final Response response) {
@@ -193,6 +217,8 @@ public class WorldlineControlTransportTest {
             input.readUTF(), input.readDouble(), input.readDouble(), input.readDouble(),
             input.readInt()));
       }
+      int payloadLength = input.readInt();
+      payloads.add(boxed(input.readNBytes(payloadLength)));
 
       DataOutputStream output = new DataOutputStream(socket.getOutputStream());
       output.writeInt(WorldlineControlTransport.MAGIC);
@@ -203,6 +229,10 @@ public class WorldlineControlTransportTest {
       output.writeInt(HandoffControlPlane.PROTOCOL_VERSION);
       output.writeBoolean(true);
       output.writeUTF("accepted");
+      byte[] responsePayload = response == Response.VALID_PAYLOAD
+          ? new byte[]{4, 5, 6} : new byte[0];
+      output.writeInt(responsePayload.length);
+      output.write(responsePayload);
       ControlEnvelope echoed = response == Response.WRONG_TRANSFER
           ? new ControlEnvelope(received.protocolVersion(), UUID.randomUUID(),
               received.playerUuid(), received.sourceServerId(), received.destinationServerId(),
@@ -253,5 +283,13 @@ public class WorldlineControlTransportTest {
       output.writeLong(envelope.playerSessionEpoch());
       output.writeLong(envelope.playerStateVersion());
     }
+  }
+
+  private static List<Byte> boxed(final byte[] bytes) {
+    List<Byte> result = new ArrayList<>(bytes.length);
+    for (byte value : bytes) {
+      result.add(value);
+    }
+    return result;
   }
 }

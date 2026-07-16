@@ -61,6 +61,26 @@ public class HandoffControlPlaneTest {
   }
 
   @Test
+  void scriptedFreezeStageAbortUnfreezesWithoutCommitting() {
+    LivePlayerSessionStore sessions = new LivePlayerSessionStore();
+    sessions.putActive(PLAYER, CLIENT, "server-a");
+    HandoffControlPlane control = new HandoffControlPlane(sessions);
+    ControlEnvelope envelope = envelope();
+
+    assertEquals(APPLIED, control.prepare(envelope, TARGET).status());
+    HandoffControlPlane.SnapshotResult frozen = control.freezeSource(envelope);
+    assertEquals(APPLIED, frozen.transition().status());
+    assertEquals(APPLIED, control.stageSnapshot(envelope, frozen.snapshot()).status());
+    assertEquals(APPLIED, control.abort(envelope).status());
+
+    LivePlayerSession session = sessions.get(PLAYER).orElseThrow();
+    assertEquals("server-a", session.authoritativeServerId());
+    assertEquals(0, session.playerSessionEpoch());
+    assertEquals(HandoffPhase.ACTIVE_SOURCE, session.handoffPhase());
+    assertEquals(null, session.activeTransferId());
+  }
+
+  @Test
   void scriptedCommitRoundTrip() {
     LivePlayerSessionStore sessions = new LivePlayerSessionStore();
     sessions.putActive(PLAYER, CLIENT, "server-a");
@@ -68,8 +88,9 @@ public class HandoffControlPlaneTest {
     ControlEnvelope envelope = envelope();
 
     assertEquals(APPLIED, control.prepare(envelope, TARGET).status());
-    assertEquals(APPLIED, control.freezeSource(envelope).status());
-    assertEquals(APPLIED, control.stageSnapshot(envelope).status());
+    HandoffControlPlane.SnapshotResult frozen = control.freezeSource(envelope);
+    assertEquals(APPLIED, frozen.transition().status());
+    assertEquals(APPLIED, control.stageSnapshot(envelope, frozen.snapshot()).status());
     assertEquals(APPLIED, control.commit(envelope).status());
     assertEquals(APPLIED, control.activateDestination(envelope).status());
     assertEquals(APPLIED, control.cleanSource(envelope).status());
@@ -85,7 +106,7 @@ public class HandoffControlPlaneTest {
     LivePlayerSessionStore sessions = new LivePlayerSessionStore();
     sessions.putActive(PLAYER, CLIENT, "server-a");
     HandoffControlPlane control = new HandoffControlPlane(sessions);
-    ControlEnvelope envelope = new ControlEnvelope(3, TRANSFER, PLAYER, "server-a", "server-b",
+    ControlEnvelope envelope = new ControlEnvelope(2, TRANSFER, PLAYER, "server-a", "server-b",
         "west", "east", 0, 0, 0, 0);
 
     assertThrows(IllegalArgumentException.class, () -> control.prepare(envelope, TARGET));
