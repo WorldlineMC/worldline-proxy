@@ -19,6 +19,7 @@ package com.velocitypowered.proxy.worldline;
 
 import static com.velocitypowered.proxy.worldline.LivePlayerSessionStore.Status.ALREADY_APPLIED;
 import static com.velocitypowered.proxy.worldline.LivePlayerSessionStore.Status.APPLIED;
+import static com.velocitypowered.proxy.worldline.LivePlayerSessionStore.Status.CONTROL_UNAVAILABLE;
 import static com.velocitypowered.proxy.worldline.LivePlayerSessionStore.Status.INJECTED_DROP;
 import static com.velocitypowered.proxy.worldline.LivePlayerSessionStore.Status.REJECTED_PARTITION_EPOCH;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -39,6 +40,8 @@ public class HandoffControlPlaneTest {
   private static final UUID PLAYER = UUID.fromString("00000000-0000-0000-0000-000000000011");
   private static final UUID CLIENT = UUID.fromString("00000000-0000-0000-0000-000000000012");
   private static final UUID TRANSFER = UUID.fromString("00000000-0000-0000-0000-000000000013");
+  private static final PrepareTarget TARGET = new PrepareTarget("WorldlineTest", "world",
+      "minecraft:overworld", "test-v1", 8, 64, 0, 1);
 
   @TempDir
   Path tempDir;
@@ -49,8 +52,8 @@ public class HandoffControlPlaneTest {
     sessions.putActive(PLAYER, CLIENT, "server-a");
     HandoffControlPlane control = new HandoffControlPlane(sessions);
 
-    assertEquals(APPLIED, control.prepare(envelope()).status());
-    assertEquals(ALREADY_APPLIED, control.prepare(envelope()).status());
+    assertEquals(APPLIED, control.prepare(envelope(), TARGET).status());
+    assertEquals(ALREADY_APPLIED, control.prepare(envelope(), TARGET).status());
     assertEquals(HandoffPhase.DESTINATION_READY, sessions.get(PLAYER).orElseThrow().handoffPhase());
     assertEquals(APPLIED, control.abort(envelope()).status());
     assertEquals(HandoffPhase.ACTIVE_SOURCE, sessions.get(PLAYER).orElseThrow().handoffPhase());
@@ -64,7 +67,7 @@ public class HandoffControlPlaneTest {
     HandoffControlPlane control = new HandoffControlPlane(sessions);
     ControlEnvelope envelope = envelope();
 
-    assertEquals(APPLIED, control.prepare(envelope).status());
+    assertEquals(APPLIED, control.prepare(envelope, TARGET).status());
     assertEquals(APPLIED, control.freezeSource(envelope).status());
     assertEquals(APPLIED, control.stageSnapshot(envelope).status());
     assertEquals(APPLIED, control.commit(envelope).status());
@@ -82,10 +85,10 @@ public class HandoffControlPlaneTest {
     LivePlayerSessionStore sessions = new LivePlayerSessionStore();
     sessions.putActive(PLAYER, CLIENT, "server-a");
     HandoffControlPlane control = new HandoffControlPlane(sessions);
-    ControlEnvelope envelope = new ControlEnvelope(2, TRANSFER, PLAYER, "server-a", "server-b",
+    ControlEnvelope envelope = new ControlEnvelope(3, TRANSFER, PLAYER, "server-a", "server-b",
         "west", "east", 0, 0, 0, 0);
 
-    assertThrows(IllegalArgumentException.class, () -> control.prepare(envelope));
+    assertThrows(IllegalArgumentException.class, () -> control.prepare(envelope, TARGET));
   }
 
   @Test
@@ -97,7 +100,7 @@ public class HandoffControlPlaneTest {
     ControlEnvelope stale = new ControlEnvelope(HandoffControlPlane.PROTOCOL_VERSION, TRANSFER,
         PLAYER, "server-a", "server-b", "west", "east", 0, 1, 0, 0);
 
-    assertEquals(REJECTED_PARTITION_EPOCH, control.prepare(stale).status());
+    assertEquals(REJECTED_PARTITION_EPOCH, control.prepare(stale, TARGET).status());
     assertEquals(HandoffPhase.ACTIVE_SOURCE, sessions.get(PLAYER).orElseThrow().handoffPhase());
   }
 
@@ -110,8 +113,35 @@ public class HandoffControlPlaneTest {
     ControlEnvelope stale = new ControlEnvelope(HandoffControlPlane.PROTOCOL_VERSION, TRANSFER,
         PLAYER, "server-a", "server-b", "west", "east", 1, 0, 0, 0);
 
-    assertEquals(REJECTED_PARTITION_EPOCH, control.prepare(stale).status());
+    assertEquals(REJECTED_PARTITION_EPOCH, control.prepare(stale, TARGET).status());
     assertEquals(HandoffPhase.ACTIVE_SOURCE, sessions.get(PLAYER).orElseThrow().handoffPhase());
+  }
+
+  @Test
+  void controlFailureRestoresSourceAuthority() throws Exception {
+    LivePlayerSessionStore sessions = new LivePlayerSessionStore();
+    sessions.putActive(PLAYER, CLIENT, "server-a");
+    HandoffControlPlane control = new HandoffControlPlane(sessions);
+    control.configure(partitionMap());
+
+    assertEquals(CONTROL_UNAVAILABLE, control.prepare(envelopeWithEpochs(), TARGET).status());
+    LivePlayerSession session = sessions.get(PLAYER).orElseThrow();
+    assertEquals(HandoffPhase.ACTIVE_SOURCE, session.handoffPhase());
+    assertEquals(null, session.activeTransferId());
+    assertEquals(0, session.playerSessionEpoch());
+  }
+
+  @Test
+  void prepareTargetCarriesTheConfiguredCompatibilityFence() throws Exception {
+    HandoffControlPlane control = new HandoffControlPlane(new LivePlayerSessionStore());
+    control.configure(partitionMap());
+
+    PrepareTarget target = control.prepareTarget("WorldlineTest", 8, 64, 0);
+
+    assertEquals("world", target.levelName());
+    assertEquals("minecraft:overworld", target.dimension());
+    assertEquals("test-v1", target.compatibilityId());
+    assertEquals(1, target.visibilityRadiusChunks());
   }
 
   @Test
@@ -135,7 +165,7 @@ public class HandoffControlPlaneTest {
     System.setProperty(property, "crash");
     try {
       assertThrows(IllegalStateException.class,
-          () -> new HandoffControlPlane(sessions).prepare(envelope()));
+          () -> new HandoffControlPlane(sessions).prepare(envelope(), TARGET));
     } finally {
       System.clearProperty(property);
     }
@@ -149,7 +179,7 @@ public class HandoffControlPlaneTest {
       LivePlayerSessionStore sessions = new LivePlayerSessionStore();
       sessions.putActive(PLAYER, CLIENT, "server-a");
       LivePlayerSessionStore.TransitionResult result =
-          new HandoffControlPlane(sessions).prepare(envelope());
+          new HandoffControlPlane(sessions).prepare(envelope(), TARGET);
       return new FailureRun(result, sessions.get(PLAYER).orElseThrow());
     } finally {
       System.clearProperty(property);
@@ -162,12 +192,13 @@ public class HandoffControlPlaneTest {
         [world]
         level-name = "world"
         dimension = "minecraft:overworld"
+        compatibility-id = "test-v1"
 
         [servers.server-a]
-        control-address = "127.0.0.1:25576"
+        control-address = "127.0.0.1:1"
 
         [servers.server-b]
-        control-address = "127.0.0.1:25577"
+        control-address = "127.0.0.1:1"
 
         [[partitions]]
         id = "west"
@@ -187,6 +218,11 @@ public class HandoffControlPlaneTest {
   private static ControlEnvelope envelope() {
     return new ControlEnvelope(HandoffControlPlane.PROTOCOL_VERSION, TRANSFER, PLAYER,
         "server-a", "server-b", "west", "east", 0, 0, 0, 0);
+  }
+
+  private static ControlEnvelope envelopeWithEpochs() {
+    return new ControlEnvelope(HandoffControlPlane.PROTOCOL_VERSION, TRANSFER, PLAYER,
+        "server-a", "server-b", "west", "east", 1, 1, 0, 0);
   }
 
   private record FailureRun(LivePlayerSessionStore.TransitionResult result,

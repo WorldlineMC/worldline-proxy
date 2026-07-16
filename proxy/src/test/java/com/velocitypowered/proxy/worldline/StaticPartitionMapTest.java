@@ -41,6 +41,7 @@ public class StaticPartitionMapTest {
         [world]
         level-name = "world"
         dimension = "minecraft:overworld"
+        compatibility-id = "test-v1"
 
         [servers.server-a]
         control-address = "127.0.0.1:25576"
@@ -68,6 +69,7 @@ public class StaticPartitionMapTest {
     assertEquals("west", map.partitionFor("world", "minecraft:overworld", -1).orElseThrow().id());
     assertEquals("east", map.partitionFor("world", "minecraft:overworld", 0).orElseThrow().id());
     assertEquals(25576, map.controlAddress("server-a").orElseThrow().getPort());
+    assertEquals("test-v1", map.compatibilityId());
     assertTrue(map.owns("east", "server-b", 1));
     assertFalse(map.owns("east", "server-b", 0));
     assertTrue(map.ownerFor("other", "minecraft:overworld", 0).isEmpty());

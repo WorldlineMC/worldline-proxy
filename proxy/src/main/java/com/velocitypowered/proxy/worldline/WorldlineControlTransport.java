@@ -23,6 +23,7 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.util.UUID;
+import org.checkerframework.checker.nullness.qual.Nullable;
 
 /**
  * Slice-only blocking TCP transport for proxy-to-server handoff commands. Each request opens a
@@ -45,6 +46,14 @@ public final class WorldlineControlTransport {
    */
   public void send(final String serverId, final String command,
       final ControlEnvelope envelope) throws IOException {
+    send(serverId, command, envelope, null);
+  }
+
+  /**
+   * Sends one idempotent command with an optional destination preparation target.
+   */
+  public void send(final String serverId, final String command,
+      final ControlEnvelope envelope, final @Nullable PrepareTarget target) throws IOException {
     InetSocketAddress address = partitions.controlAddress(serverId)
         .orElseThrow(() -> new IOException("No control endpoint for " + serverId));
     try (Socket socket = new Socket()) {
@@ -64,6 +73,17 @@ public final class WorldlineControlTransport {
       output.writeLong(envelope.destinationPartitionEpoch());
       output.writeLong(envelope.playerSessionEpoch());
       output.writeLong(envelope.playerStateVersion());
+      output.writeBoolean(target != null);
+      if (target != null) {
+        output.writeUTF(target.playerName());
+        output.writeUTF(target.levelName());
+        output.writeUTF(target.dimension());
+        output.writeUTF(target.compatibilityId());
+        output.writeDouble(target.x());
+        output.writeDouble(target.y());
+        output.writeDouble(target.z());
+        output.writeInt(target.visibilityRadiusChunks());
+      }
       output.flush();
 
       DataInputStream input = new DataInputStream(socket.getInputStream());
@@ -84,7 +104,8 @@ public final class WorldlineControlTransport {
       if (!responseEnvelope.equals(envelope) || !responseServer.equals(serverId)) {
         throw new IOException("Mismatched Worldline control acknowledgement from " + serverId);
       }
-      boolean sourceCommand = command.equals("FREEZE_SOURCE") || command.equals("CLEAN_SOURCE");
+      boolean sourceCommand = command.equals("CHECK_PREPARE")
+          || command.equals("FREEZE_SOURCE") || command.equals("CLEAN_SOURCE");
       String expectedPartition = sourceCommand
           ? envelope.sourcePartitionId() : envelope.destinationPartitionId();
       long expectedEpoch = sourceCommand

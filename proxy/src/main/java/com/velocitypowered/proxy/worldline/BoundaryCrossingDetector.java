@@ -58,11 +58,23 @@ public final class BoundaryCrossingDetector {
       return Decision.forward();
     }
     if (!target.orElseThrow().owner().equals(currentServerId)) {
-      return Decision.withholdCrossing(current.orElseThrow(), target.orElseThrow());
+      return Decision.withholdCrossing(current.orElseThrow(), target.orElseThrow(), toChunk);
     }
     return nearestRemotePartition(currentServerId, toChunk)
-        .map(remote -> Decision.prepare(target.orElseThrow(), remote))
+        .map(remote -> Decision.prepare(target.orElseThrow(), remote,
+            entryChunk(remote, toChunk)))
         .orElseGet(Decision::forward);
+  }
+
+  private static int entryChunk(final StaticPartitionMap.Partition remote,
+      final int sourceChunk) {
+    if (remote.chunkMin() != null && remote.chunkMin() > sourceChunk) {
+      return remote.chunkMin();
+    }
+    if (remote.chunkMax() != null && remote.chunkMax() < sourceChunk) {
+      return remote.chunkMax();
+    }
+    return sourceChunk;
   }
 
   private Optional<StaticPartitionMap.Partition> nearestRemotePartition(
@@ -91,42 +103,51 @@ public final class BoundaryCrossingDetector {
    */
   public record Decision(Action action, Optional<String> sourcePartitionId,
                          Optional<String> remotePartitionId, Optional<String> remoteOwner,
-                         long sourcePartitionEpoch, long remotePartitionEpoch) {
+                         long sourcePartitionEpoch, long remotePartitionEpoch,
+                         int remoteEntryChunkX) {
 
     static Decision forward() {
       return new Decision(Action.FORWARD, Optional.empty(), Optional.empty(), Optional.empty(),
-          0, 0);
+          0, 0, 0);
     }
 
     static Decision prepare(final StaticPartitionMap.Partition source,
-        final StaticPartitionMap.Partition remote) {
+        final StaticPartitionMap.Partition remote, final int remoteEntryChunkX) {
       return new Decision(Action.PREPARE, Optional.of(source.id()), Optional.of(remote.id()),
-          Optional.of(remote.owner()), source.epoch(), remote.epoch());
+          Optional.of(remote.owner()), source.epoch(), remote.epoch(), remoteEntryChunkX);
     }
 
     static Decision withholdCrossing(final StaticPartitionMap.Partition source,
-        final StaticPartitionMap.Partition remote) {
+        final StaticPartitionMap.Partition remote, final int remoteEntryChunkX) {
       return new Decision(Action.WITHHOLD_CROSSING, Optional.of(source.id()),
-          Optional.of(remote.id()), Optional.of(remote.owner()), source.epoch(), remote.epoch());
+          Optional.of(remote.id()), Optional.of(remote.owner()), source.epoch(), remote.epoch(),
+          remoteEntryChunkX);
+    }
+
+    static Decision withholdCrossing(final Decision decision) {
+      return new Decision(Action.WITHHOLD_CROSSING, decision.sourcePartitionId(),
+          decision.remotePartitionId(), decision.remoteOwner(), decision.sourcePartitionEpoch(),
+          decision.remotePartitionEpoch(), decision.remoteEntryChunkX());
+    }
+
+    static Decision prepareAndWithhold(final Decision decision) {
+      return new Decision(Action.PREPARE_AND_WITHHOLD, decision.sourcePartitionId(),
+          decision.remotePartitionId(), decision.remoteOwner(), decision.sourcePartitionEpoch(),
+          decision.remotePartitionEpoch(), decision.remoteEntryChunkX());
     }
 
     static Decision bufferLimitExceeded(final Decision decision) {
       return new Decision(Action.BUFFER_LIMIT_EXCEEDED, decision.sourcePartitionId(),
           decision.remotePartitionId(), decision.remoteOwner(), decision.sourcePartitionEpoch(),
-          decision.remotePartitionEpoch());
+          decision.remotePartitionEpoch(), decision.remoteEntryChunkX());
     }
 
     static Decision prepareTimeout(final Decision decision) {
       return new Decision(Action.PREPARE_TIMEOUT, decision.sourcePartitionId(),
           decision.remotePartitionId(), decision.remoteOwner(), decision.sourcePartitionEpoch(),
-          decision.remotePartitionEpoch());
+          decision.remotePartitionEpoch(), decision.remoteEntryChunkX());
     }
 
-    static Decision prepareNotReady(final Decision decision) {
-      return new Decision(Action.PREPARE_NOT_READY, decision.sourcePartitionId(),
-          decision.remotePartitionId(), decision.remoteOwner(), decision.sourcePartitionEpoch(),
-          decision.remotePartitionEpoch());
-    }
   }
 
   /**
@@ -135,9 +156,9 @@ public final class BoundaryCrossingDetector {
   public enum Action {
     FORWARD,
     PREPARE,
+    PREPARE_AND_WITHHOLD,
     WITHHOLD_CROSSING,
     BUFFER_LIMIT_EXCEEDED,
-    PREPARE_TIMEOUT,
-    PREPARE_NOT_READY
+    PREPARE_TIMEOUT
   }
 }

@@ -21,7 +21,7 @@ import java.nio.file.Path;
 import java.util.UUID;
 
 /**
- * Scriptable prepare-abort round trip against the two Paper control endpoints.
+ * Scriptable M3 prepare-abort round trip against the two Paper control endpoints.
  */
 public final class HandoffControlPlaneDemo {
 
@@ -53,9 +53,12 @@ public final class HandoffControlPlaneDemo {
         sessions.get(player).orElseThrow().activeTransferId());
     System.out.printf("prepare sent transfer_id=%s source=server-a destination=server-b%n",
         transfer);
-    require(LivePlayerSessionStore.Status.APPLIED, control.prepare(envelope).status(), "prepare");
+    PrepareTarget target = control.prepareTarget("WorldlineDemo", 8, 64, 0);
+    require(LivePlayerSessionStore.Status.APPLIED, control.prepare(envelope, target).status(),
+        "prepare");
     require(HandoffPhase.DESTINATION_READY, sessions.get(player).orElseThrow().handoffPhase(),
         "prepared phase");
+    System.out.println("destination loaded target halo and prepared a non-authoritative player");
     System.out.println("destination acknowledgement received phase=DESTINATION_READY");
     System.out.printf("abort requested transfer_id=%s%n", transfer);
     require(LivePlayerSessionStore.Status.APPLIED, control.abort(envelope).status(), "abort");

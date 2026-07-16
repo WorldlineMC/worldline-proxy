@@ -51,6 +51,7 @@ public class BoundaryCrossingDetectorTest {
     assertEquals("west", decision.sourcePartitionId().orElseThrow());
     assertEquals("east", decision.remotePartitionId().orElseThrow());
     assertEquals("server-b", decision.remoteOwner().orElseThrow());
+    assertEquals(0, decision.remoteEntryChunkX());
   }
 
   @Test
@@ -77,6 +78,7 @@ public class BoundaryCrossingDetectorTest {
         [world]
         level-name = "world"
         dimension = "minecraft:overworld"
+        compatibility-id = "test-v1"
 
         [servers.server-a]
         control-address = "127.0.0.1:25576"

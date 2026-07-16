@@ -81,6 +81,7 @@ import com.velocitypowered.proxy.worldline.ControlEnvelope;
 import com.velocitypowered.proxy.worldline.HandoffControlPlane;
 import com.velocitypowered.proxy.worldline.LivePlayerSession;
 import com.velocitypowered.proxy.worldline.LivePlayerSessionStore;
+import com.velocitypowered.proxy.worldline.PrepareTarget;
 import com.velocitypowered.proxy.worldline.ServerboundMovementRouter;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufUtil;
@@ -137,6 +138,9 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
   private final @Nullable ServerboundMovementRouter worldlineMovementRouter;
   private final UUID worldlineClientConnectionId = UUID.randomUUID();
   private @Nullable UUID worldlineTransferId;
+  private @Nullable ControlEnvelope worldlineEnvelope;
+  private @Nullable CompletableFuture<LivePlayerSessionStore.TransitionResult>
+      worldlinePrepareFuture;
 
   private CompletableFuture<Void> configSwitchFuture;
 
@@ -536,47 +540,36 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
     }
     String serverId = serverConnection.getServer().getServerInfo().getName();
     BoundaryCrossingDetector.Decision decision = worldlineMovementRouter.route(serverId, packet);
-    if (decision.action() == BoundaryCrossingDetector.Action.PREPARE) {
-      LivePlayerSessionStore sessions = server.getWorldlineLiveSessions();
-      if (sessions.get(player.getUniqueId()).isEmpty()) {
-        sessions.putActive(player.getUniqueId(), worldlineClientConnectionId, serverId);
-      }
-      if (worldlineTransferId == null) {
-        worldlineTransferId = UUID.randomUUID();
-      }
-      String destinationServerId = decision.remoteOwner().orElse("unknown");
-      ControlEnvelope envelope = worldlineEnvelope(worldlineTransferId, serverId,
-          destinationServerId, decision, sessions.get(player.getUniqueId()).orElseThrow());
-      LivePlayerSessionStore.TransitionResult result =
-          server.getWorldlineControlPlane().prepare(envelope);
-      logger.info("Worldline preparing {} handoff from {} to {}", player, serverId,
-          decision.remoteOwner().orElse("unknown"));
-      if (result.status() != LivePlayerSessionStore.Status.APPLIED
-          && result.status() != LivePlayerSessionStore.Status.ALREADY_APPLIED) {
-        worldlineTransferId = null;
-        worldlineMovementRouter.clearBuffer();
-        logger.warn("Worldline prepare rejected for {} from {} to {}: {}", player, serverId,
-            destinationServerId, result.status());
+    if (decision.action() == BoundaryCrossingDetector.Action.PREPARE
+        || decision.action() == BoundaryCrossingDetector.Action.PREPARE_AND_WITHHOLD) {
+      beginWorldlinePreparation(serverId, decision, packet);
+      if (decision.action() == BoundaryCrossingDetector.Action.PREPARE_AND_WITHHOLD) {
+        logWorldlineCrossingWithheld(serverId, decision);
+        return true;
       }
       return false;
     }
     if (decision.action() == BoundaryCrossingDetector.Action.WITHHOLD_CROSSING) {
-      logger.info("Worldline withheld crossing movement for {} from {} to {}", player, serverId,
-          decision.remoteOwner().orElse("unknown"));
+      if (worldlineMovementRouter.bufferedPackets().size() == 1) {
+        logWorldlineCrossingWithheld(serverId, decision);
+      }
       return true;
     }
     if (decision.action() == BoundaryCrossingDetector.Action.BUFFER_LIMIT_EXCEEDED
-        || decision.action() == BoundaryCrossingDetector.Action.PREPARE_TIMEOUT
-        || decision.action() == BoundaryCrossingDetector.Action.PREPARE_NOT_READY) {
-      abortWorldlineHandoff(serverId, decision);
+        || decision.action() == BoundaryCrossingDetector.Action.PREPARE_TIMEOUT) {
+      abortWorldlineHandoff(true);
       logger.warn("Worldline {} for {} crossing from {} to {}; dropping input",
           switch (decision.action()) {
             case PREPARE_TIMEOUT -> "prepare timed out";
-            case PREPARE_NOT_READY -> "destination not ready";
             default -> "movement buffer full";
           },
           player, serverId, decision.remoteOwner().orElse("unknown"));
       return true;
+    }
+    if (decision.action() == BoundaryCrossingDetector.Action.FORWARD
+        && worldlineTransferId != null && !worldlineMovementRouter.hasBufferedInput()) {
+      abortWorldlineHandoff();
+      logger.info("Worldline discarded preparation for {} after leaving the boundary", player);
     }
     return false;
   }
@@ -588,21 +581,97 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
     return false;
   }
 
-  private void abortWorldlineHandoff(final String serverId,
-      final BoundaryCrossingDetector.Decision decision) {
-    UUID transferId = worldlineTransferId;
-    LivePlayerSession session = server.getWorldlineLiveSessions().get(player.getUniqueId())
-        .orElse(null);
-    if (transferId == null || session == null) {
+  private void beginWorldlinePreparation(final String serverId,
+      final BoundaryCrossingDetector.Decision decision,
+      final ServerboundMovePlayerPacket packet) {
+    if (worldlineTransferId != null) {
       return;
     }
-    ControlEnvelope envelope = worldlineEnvelope(transferId, serverId,
-        decision.remoteOwner().orElse("unknown"), decision, session);
-    LivePlayerSessionStore.TransitionResult result = server.getWorldlineControlPlane().abort(envelope);
-    if (result.status() == LivePlayerSessionStore.Status.APPLIED
-        || result.status() == LivePlayerSessionStore.Status.ALREADY_APPLIED) {
+    LivePlayerSessionStore sessions = server.getWorldlineLiveSessions();
+    if (sessions.get(player.getUniqueId()).isEmpty()) {
+      sessions.putActive(player.getUniqueId(), worldlineClientConnectionId, serverId);
+    }
+    UUID transferId = UUID.randomUUID();
+    String destinationServerId = decision.remoteOwner().orElse("unknown");
+    ControlEnvelope envelope = worldlineEnvelope(transferId, serverId, destinationServerId,
+        decision, sessions.get(player.getUniqueId()).orElseThrow());
+    double targetX = decision.action() == BoundaryCrossingDetector.Action.PREPARE
+        ? decision.remoteEntryChunkX() * 16.0 + 8.0 : packet.getX();
+    final PrepareTarget target = server.getWorldlineControlPlane().prepareTarget(player.getUsername(),
+        targetX, packet.getY(), packet.getZ());
+    CompletableFuture<LivePlayerSessionStore.TransitionResult> future = new CompletableFuture<>();
+    worldlineTransferId = transferId;
+    worldlineEnvelope = envelope;
+    worldlinePrepareFuture = future;
+    logger.info("Worldline preparing {} handoff from {} to {}", player, serverId,
+        destinationServerId);
+    Thread.startVirtualThread(() -> {
+      try {
+        future.complete(server.getWorldlineControlPlane().prepare(envelope, target));
+      } catch (Throwable throwable) {
+        future.completeExceptionally(throwable);
+      }
+    });
+    future.whenCompleteAsync((result, failure) -> {
+      if (worldlinePrepareFuture != future || worldlineEnvelope != envelope) {
+        return;
+      }
+      worldlinePrepareFuture = null;
+      if (failure == null && (result.status() == LivePlayerSessionStore.Status.APPLIED
+          || result.status() == LivePlayerSessionStore.Status.ALREADY_APPLIED)) {
+        worldlineMovementRouter.markDestinationReady();
+        logger.info("Worldline destination ready for {} from {} to {}", player, serverId,
+            destinationServerId);
+        return;
+      }
       worldlineTransferId = null;
-      worldlineMovementRouter.clearBuffer();
+      worldlineEnvelope = null;
+      if (worldlineMovementRouter.hasBufferedInput()) {
+        worldlineMovementRouter.blockCrossing();
+      } else {
+        worldlineMovementRouter.clearBuffer();
+      }
+      logger.warn("Worldline prepare rejected for {} from {} to {}: {}", player, serverId,
+          destinationServerId, failure == null ? result.status() : failure.getMessage());
+    }, player.getConnection().eventLoop());
+  }
+
+  private void abortWorldlineHandoff() {
+    abortWorldlineHandoff(false);
+  }
+
+  private void abortWorldlineHandoff(final boolean blockCrossing) {
+    final ControlEnvelope envelope = worldlineEnvelope;
+    final CompletableFuture<LivePlayerSessionStore.TransitionResult> prepareFuture =
+        worldlinePrepareFuture;
+    worldlineTransferId = null;
+    worldlineEnvelope = null;
+    worldlinePrepareFuture = null;
+    if (worldlineMovementRouter != null) {
+      if (blockCrossing) {
+        worldlineMovementRouter.blockCrossing();
+      } else {
+        worldlineMovementRouter.clearBuffer();
+      }
+    }
+    if (envelope == null) {
+      return;
+    }
+    Runnable abort = () -> {
+      LivePlayerSessionStore.TransitionResult result =
+          server.getWorldlineControlPlane().abort(envelope);
+      if (result.status() != LivePlayerSessionStore.Status.APPLIED
+          && result.status() != LivePlayerSessionStore.Status.ALREADY_APPLIED
+          && result.status() != LivePlayerSessionStore.Status.MISSING_SESSION) {
+        logger.warn("Worldline abort rejected for {} transfer {}: {}", player,
+            envelope.transferId(), result.status());
+      }
+    };
+    if (prepareFuture == null) {
+      Thread.startVirtualThread(abort);
+    } else {
+      // Preserve command order so a late PREPARE cannot recreate state after ABORT.
+      prepareFuture.whenComplete((ignored, failure) -> Thread.startVirtualThread(abort));
     }
   }
 
@@ -616,17 +685,14 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
         decision.remotePartitionEpoch(), session.playerSessionEpoch(), 0);
   }
 
+  private void logWorldlineCrossingWithheld(final String serverId,
+      final BoundaryCrossingDetector.Decision decision) {
+    logger.info("Worldline withheld crossing movement for {} from {} to {}", player, serverId,
+        decision.remoteOwner().orElse("unknown"));
+  }
+
   @Override
   public void handleGeneric(MinecraftPacket packet) {
-    if (worldlineMovementRouter != null && worldlineMovementRouter.hasBufferedInput()) {
-      VelocityServerConnection serverConnection = player.getConnectedServer();
-      abortWorldlineHandoff(serverConnection == null ? "unknown"
-          : serverConnection.getServer().getServerInfo().getName(),
-          worldlineMovementRouter.bufferedDecision());
-      logger.warn("Worldline dropped unclassified packet {} while handoff input is buffered",
-          packet.getClass().getSimpleName());
-      return;
-    }
     VelocityServerConnection serverConnection = player.getConnectedServer();
     if (serverConnection == null) {
       // No server connection yet, probably transitioning.
@@ -648,14 +714,6 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
 
   @Override
   public void handleUnknown(ByteBuf buf) {
-    if (worldlineMovementRouter != null && worldlineMovementRouter.hasBufferedInput()) {
-      VelocityServerConnection serverConnection = player.getConnectedServer();
-      abortWorldlineHandoff(serverConnection == null ? "unknown"
-          : serverConnection.getServer().getServerInfo().getName(),
-          worldlineMovementRouter.bufferedDecision());
-      logger.warn("Worldline dropped unknown packet while handoff input is buffered");
-      return;
-    }
     VelocityServerConnection serverConnection = player.getConnectedServer();
     if (serverConnection == null) {
       // No server connection yet, probably transitioning.
@@ -674,11 +732,8 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
 
   @Override
   public void disconnected() {
+    abortWorldlineHandoff();
     server.getWorldlineLiveSessions().remove(player.getUniqueId(), worldlineClientConnectionId);
-    worldlineTransferId = null;
-    if (worldlineMovementRouter != null) {
-      worldlineMovementRouter.clearBuffer();
-    }
     player.teardown();
   }
 

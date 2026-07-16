@@ -36,13 +36,16 @@ public final class StaticPartitionMap {
 
   private final String levelName;
   private final String dimension;
+  private final String compatibilityId;
   private final Map<String, InetSocketAddress> controlAddresses;
   private final List<Partition> partitions;
 
   private StaticPartitionMap(final String levelName, final String dimension,
+      final String compatibilityId,
       final Map<String, InetSocketAddress> controlAddresses, final List<Partition> partitions) {
     this.levelName = levelName;
     this.dimension = dimension;
+    this.compatibilityId = compatibilityId;
     this.controlAddresses = Map.copyOf(controlAddresses);
     this.partitions = List.copyOf(partitions);
   }
@@ -55,6 +58,7 @@ public final class StaticPartitionMap {
       config.load();
       String levelName = require(config, "world.level-name");
       String dimension = require(config, "world.dimension");
+      String compatibilityId = require(config, "world.compatibility-id");
       Config serverConfigs = require(config, "servers");
       Map<String, InetSocketAddress> controlAddresses = new HashMap<>();
       for (Map.Entry<String, Object> entry : serverConfigs.valueMap().entrySet()) {
@@ -70,7 +74,8 @@ public final class StaticPartitionMap {
             requireNumber(partition, "epoch").longValue(), partition.get("chunk-x-min"),
             partition.get("chunk-x-max")));
       }
-      return new StaticPartitionMap(levelName, dimension, controlAddresses, partitions);
+      return new StaticPartitionMap(levelName, dimension, compatibilityId, controlAddresses,
+          partitions);
     } catch (RuntimeException e) {
       throw new IOException("Invalid Worldline partition map: " + path, e);
     }
@@ -109,6 +114,13 @@ public final class StaticPartitionMap {
    */
   public String dimension() {
     return dimension;
+  }
+
+  /**
+   * Returns the operator-verified registry and client-facing configuration fence.
+   */
+  public String compatibilityId() {
+    return compatibilityId;
   }
 
   /**

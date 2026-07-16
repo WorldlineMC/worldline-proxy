@@ -19,6 +19,7 @@ package com.velocitypowered.proxy.worldline;
 
 import java.io.IOException;
 import java.util.Locale;
+import java.util.Objects;
 import java.util.UUID;
 import java.util.function.Supplier;
 import org.apache.logging.log4j.LogManager;
@@ -30,7 +31,7 @@ import org.checkerframework.checker.nullness.qual.Nullable;
  */
 public final class HandoffControlPlane {
 
-  public static final int PROTOCOL_VERSION = 1;
+  public static final int PROTOCOL_VERSION = 2;
   private static final Logger logger = LogManager.getLogger(HandoffControlPlane.class);
 
   private final LivePlayerSessionStore sessions;
@@ -52,10 +53,18 @@ public final class HandoffControlPlane {
     this.transport = new WorldlineControlTransport(partitions);
   }
 
-  /**
-   * Runs the M2 placeholder-payload prepare path through destination-ready.
-   */
-  public LivePlayerSessionStore.TransitionResult prepare(final ControlEnvelope envelope) {
+  /** Builds the destination resources request from the loaded slice config. */
+  public PrepareTarget prepareTarget(final String playerName, final double x, final double y,
+      final double z) {
+    StaticPartitionMap current = Objects.requireNonNull(partitions,
+        "Worldline control plane is not configured");
+    return new PrepareTarget(playerName, current.levelName(), current.dimension(),
+        current.compatibilityId(), x, y, z, 1);
+  }
+
+  /** Runs destination preparation through destination-ready. */
+  public LivePlayerSessionStore.TransitionResult prepare(final ControlEnvelope envelope,
+      final PrepareTarget target) {
     validateProtocol(envelope);
     LivePlayerSessionStore.TransitionResult ownership = validateOwnership(envelope);
     if (ownership != null) {
@@ -69,15 +78,25 @@ public final class HandoffControlPlane {
         && begin.status() != LivePlayerSessionStore.Status.ALREADY_APPLIED) {
       return begin;
     }
-    if (!send(envelope.destinationServerId(), "PREPARE", envelope)) {
-      transition(HandoffPhase.ACTIVE_SOURCE, envelope,
-          () -> sessions.abortTransfer(envelope.playerUuid(), envelope.playerSessionEpoch(),
-              envelope.transferId(), envelope.sourceServerId()));
-      return sessions.controlUnavailable(envelope.playerUuid());
+    try {
+      if (!send(envelope.sourceServerId(), "CHECK_PREPARE", envelope, target)
+          || !send(envelope.destinationServerId(), "PREPARE", envelope, target)) {
+        discardPreparation(envelope);
+        return sessions.controlUnavailable(envelope.playerUuid());
+      }
+      LivePlayerSessionStore.TransitionResult ready = transition(HandoffPhase.DESTINATION_READY,
+          envelope,
+          () -> sessions.markDestinationReady(envelope.playerUuid(),
+              envelope.playerSessionEpoch(), envelope.transferId()));
+      if (ready.status() != LivePlayerSessionStore.Status.APPLIED
+          && ready.status() != LivePlayerSessionStore.Status.ALREADY_APPLIED) {
+        discardPreparation(envelope);
+      }
+      return ready;
+    } catch (RuntimeException e) {
+      discardPreparation(envelope);
+      throw e;
     }
-    return transition(HandoffPhase.DESTINATION_READY, envelope,
-        () -> sessions.markDestinationReady(envelope.playerUuid(), envelope.playerSessionEpoch(),
-            envelope.transferId()));
   }
 
   /**
@@ -93,10 +112,7 @@ public final class HandoffControlPlane {
         envelope,
         () -> sessions.abortTransfer(envelope.playerUuid(), envelope.playerSessionEpoch(),
             envelope.transferId(), envelope.sourceServerId()));
-    if (result.status() == LivePlayerSessionStore.Status.APPLIED
-        || result.status() == LivePlayerSessionStore.Status.ALREADY_APPLIED) {
-      send(envelope.destinationServerId(), "ABORT", envelope);
-    }
+    send(envelope.destinationServerId(), "ABORT", envelope);
     return result;
   }
 
@@ -264,18 +280,30 @@ public final class HandoffControlPlane {
 
   private boolean send(final String serverId, final String command,
       final ControlEnvelope envelope) {
+    return send(serverId, command, envelope, null);
+  }
+
+  private boolean send(final String serverId, final String command,
+      final ControlEnvelope envelope, final @Nullable PrepareTarget target) {
     WorldlineControlTransport current = transport;
     if (current == null) {
       return true;
     }
     try {
-      current.send(serverId, command, envelope);
+      current.send(serverId, command, envelope, target);
       return true;
     } catch (IOException e) {
       logger.warn("Worldline control command {} transfer={} server={} failed: {}", command,
           envelope.transferId(), serverId, e.getMessage());
       return false;
     }
+  }
+
+  private void discardPreparation(final ControlEnvelope envelope) {
+    transition(HandoffPhase.ACTIVE_SOURCE, envelope,
+        () -> sessions.abortTransfer(envelope.playerUuid(), envelope.playerSessionEpoch(),
+            envelope.transferId(), envelope.sourceServerId()));
+    send(envelope.destinationServerId(), "ABORT", envelope);
   }
 
   private static void validateProtocol(final ControlEnvelope envelope) {

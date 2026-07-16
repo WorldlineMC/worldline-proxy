@@ -38,6 +38,8 @@ public final class ServerboundMovementRouter {
   private final List<ServerboundMovePlayerPacket> bufferedPackets = new ArrayList<>();
   private Double lastX;
   private long prepareDeadlineNanos;
+  private boolean destinationReady;
+  private boolean crossingBlocked;
   private BoundaryCrossingDetector.Decision bufferedDecision = BoundaryCrossingDetector.Decision.forward();
 
   /**
@@ -93,19 +95,37 @@ public final class ServerboundMovementRouter {
     double fromX = lastX == null ? packet.getX() : lastX;
     BoundaryCrossingDetector.Decision decision = detector.classify(currentServerId, fromX,
         packet.getX());
+    if (crossingBlocked) {
+      if (decision.action() == BoundaryCrossingDetector.Action.WITHHOLD_CROSSING) {
+        return decision;
+      }
+      crossingBlocked = false;
+      lastX = packet.getX();
+      return BoundaryCrossingDetector.Decision.forward();
+    }
     if (decision.action() == BoundaryCrossingDetector.Action.PREPARE) {
-      if (prepareDeadlineNanos == 0) {
+      if (!destinationReady && prepareDeadlineNanos == 0) {
         prepareDeadlineNanos = ticker.getAsLong() + prepareTimeoutNanos;
       }
       lastX = packet.getX();
       return decision;
     }
     if (decision.action() == BoundaryCrossingDetector.Action.WITHHOLD_CROSSING) {
-      if (prepareDeadlineNanos == 0) {
-        return BoundaryCrossingDetector.Decision.prepareNotReady(decision);
+      long now = ticker.getAsLong();
+      if (!destinationReady && prepareDeadlineNanos == 0) {
+        prepareDeadlineNanos = now + prepareTimeoutNanos;
+        if (bufferedPackets.size() >= maxBufferedPackets) {
+          return BoundaryCrossingDetector.Decision.bufferLimitExceeded(decision);
+        }
+        bufferedPackets.add(packet);
+        bufferedDecision = BoundaryCrossingDetector.Decision.withholdCrossing(decision);
+        return BoundaryCrossingDetector.Decision.prepareAndWithhold(decision);
       }
-      if (prepareDeadlineNanos != 0 && ticker.getAsLong() > prepareDeadlineNanos) {
+      if (prepareDeadlineNanos != 0 && now > prepareDeadlineNanos) {
         return BoundaryCrossingDetector.Decision.prepareTimeout(decision);
+      }
+      if (destinationReady && prepareDeadlineNanos == 0) {
+        prepareDeadlineNanos = now + prepareTimeoutNanos;
       }
       if (bufferedPackets.size() >= maxBufferedPackets) {
         return BoundaryCrossingDetector.Decision.bufferLimitExceeded(decision);
@@ -140,6 +160,13 @@ public final class ServerboundMovementRouter {
     return bufferedDecision;
   }
 
+  /** Stops the preparation timer after the destination has proved ready. */
+  public void markDestinationReady() {
+    destinationReady = true;
+    prepareDeadlineNanos = bufferedPackets.isEmpty()
+        ? 0 : ticker.getAsLong() + prepareTimeoutNanos;
+  }
+
   /**
    * Returns and clears held input for destination replay.
    */
@@ -155,7 +182,15 @@ public final class ServerboundMovementRouter {
   public void clearBuffer() {
     bufferedPackets.clear();
     prepareDeadlineNanos = 0;
+    destinationReady = false;
+    crossingBlocked = false;
     bufferedDecision = BoundaryCrossingDetector.Decision.forward();
+  }
+
+  /** Drops remote movement after abort until the client returns to source-owned space. */
+  public void blockCrossing() {
+    clearBuffer();
+    crossingBlocked = true;
   }
 
   /**

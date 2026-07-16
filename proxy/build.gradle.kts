@@ -112,7 +112,7 @@ tasks {
         workingDir = file("run").also(File::mkdirs)
         standardInput = System.`in` // Doesn't work?
     }
-    register<JavaExec>("runM2PrepareAbort") {
+    register<JavaExec>("runM3PrepareAbort") {
         dependsOn(testClasses)
         classpath = sourceSets.test.get().runtimeClasspath
         mainClass.set("com.velocitypowered.proxy.worldline.HandoffControlPlaneDemo")

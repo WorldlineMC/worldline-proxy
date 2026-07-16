@@ -39,6 +39,8 @@ public class WorldlineControlTransportTest {
 
   private static final UUID TRANSFER = UUID.fromString("00000000-0000-0000-0000-000000000031");
   private static final UUID PLAYER = UUID.fromString("00000000-0000-0000-0000-000000000032");
+  private static final PrepareTarget TARGET = new PrepareTarget("WorldlineTest", "world",
+      "minecraft:overworld", "test-v1", 8, 64, 0, 1);
 
   @TempDir
   Path tempDir;
@@ -46,10 +48,11 @@ public class WorldlineControlTransportTest {
   @Test
   void framesAndCorrelatesCompleteEnvelope() throws Exception {
     try (FakeControlServer server = new FakeControlServer(1, Response.VALID)) {
-      transport(server.port()).send("server-b", "PREPARE", envelope());
+      transport(server.port()).send("server-b", "PREPARE", envelope(), TARGET);
 
       assertEquals(List.of("PREPARE"), server.commands());
       assertEquals(List.of(envelope()), server.envelopes());
+      assertEquals(List.of(TARGET), server.targets());
     }
   }
 
@@ -58,8 +61,8 @@ public class WorldlineControlTransportTest {
     try (FakeControlServer server = new FakeControlServer(2, Response.VALID)) {
       WorldlineControlTransport transport = transport(server.port());
 
-      transport.send("server-b", "PREPARE", envelope());
-      transport.send("server-b", "PREPARE", envelope());
+      transport.send("server-b", "PREPARE", envelope(), TARGET);
+      transport.send("server-b", "PREPARE", envelope(), TARGET);
 
       assertEquals(List.of(envelope(), envelope()), server.envelopes());
     }
@@ -69,7 +72,7 @@ public class WorldlineControlTransportTest {
   void rejectsMismatchedAcknowledgement() throws Exception {
     try (FakeControlServer server = new FakeControlServer(1, Response.WRONG_TRANSFER)) {
       assertThrows(IOException.class,
-          () -> transport(server.port()).send("server-b", "PREPARE", envelope()));
+          () -> transport(server.port()).send("server-b", "PREPARE", envelope(), TARGET));
     }
   }
 
@@ -77,7 +80,7 @@ public class WorldlineControlTransportTest {
   void rejectsMalformedResponse() throws Exception {
     try (FakeControlServer server = new FakeControlServer(1, Response.MALFORMED)) {
       assertThrows(IOException.class,
-          () -> transport(server.port()).send("server-b", "PREPARE", envelope()));
+          () -> transport(server.port()).send("server-b", "PREPARE", envelope(), TARGET));
     }
   }
 
@@ -87,6 +90,7 @@ public class WorldlineControlTransportTest {
         [world]
         level-name = "world"
         dimension = "minecraft:overworld"
+        compatibility-id = "test-v1"
 
         [servers.server-a]
         control-address = "127.0.0.1:%1$d"
@@ -125,6 +129,7 @@ public class WorldlineControlTransportTest {
     private final ServerSocket listener = new ServerSocket();
     private final List<String> commands = new ArrayList<>();
     private final List<ControlEnvelope> envelopes = new ArrayList<>();
+    private final List<PrepareTarget> targets = new ArrayList<>();
     private final Thread thread;
     private volatile Throwable failure;
 
@@ -144,6 +149,10 @@ public class WorldlineControlTransportTest {
 
     List<ControlEnvelope> envelopes() {
       return List.copyOf(envelopes);
+    }
+
+    List<PrepareTarget> targets() {
+      return List.copyOf(targets);
     }
 
     private void serve(final int requestCount, final Response response) {
@@ -179,6 +188,11 @@ public class WorldlineControlTransportTest {
           sourceServer, destinationServer, sourcePartition, destinationPartition,
           sourcePartitionEpoch, destinationPartitionEpoch, input.readLong(), input.readLong());
       envelopes.add(received);
+      if (input.readBoolean()) {
+        targets.add(new PrepareTarget(input.readUTF(), input.readUTF(), input.readUTF(),
+            input.readUTF(), input.readDouble(), input.readDouble(), input.readDouble(),
+            input.readInt()));
+      }
 
       DataOutputStream output = new DataOutputStream(socket.getOutputStream());
       output.writeInt(WorldlineControlTransport.MAGIC);

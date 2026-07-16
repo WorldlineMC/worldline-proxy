@@ -22,7 +22,7 @@ import static com.velocitypowered.proxy.protocol.ProtocolUtils.Direction.SERVERB
 import static com.velocitypowered.proxy.worldline.BoundaryCrossingDetector.Action.BUFFER_LIMIT_EXCEEDED;
 import static com.velocitypowered.proxy.worldline.BoundaryCrossingDetector.Action.FORWARD;
 import static com.velocitypowered.proxy.worldline.BoundaryCrossingDetector.Action.PREPARE;
-import static com.velocitypowered.proxy.worldline.BoundaryCrossingDetector.Action.PREPARE_NOT_READY;
+import static com.velocitypowered.proxy.worldline.BoundaryCrossingDetector.Action.PREPARE_AND_WITHHOLD;
 import static com.velocitypowered.proxy.worldline.BoundaryCrossingDetector.Action.PREPARE_TIMEOUT;
 import static com.velocitypowered.proxy.worldline.BoundaryCrossingDetector.Action.WITHHOLD_CROSSING;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -81,12 +81,26 @@ public class ServerboundMovementRouterTest {
   }
 
   @Test
-  void refusesToBufferCrossingBeforePrepareStarts() throws Exception {
+  void startsPreparationAndBuffersAnUnannouncedCrossing() throws Exception {
     ServerboundMovementRouter router = router();
 
     assertEquals(FORWARD, router.route("server-a", position(-32)).action());
-    assertEquals(PREPARE_NOT_READY, router.route("server-a", position(0)).action());
+    assertEquals(PREPARE_AND_WITHHOLD, router.route("server-a", position(0)).action());
+    assertEquals(1, router.bufferedPackets().size());
+  }
+
+  @Test
+  void blocksRepeatedRemoteMovementAfterAbortUntilReturningToSource() throws Exception {
+    ServerboundMovementRouter router = router();
+
+    assertEquals(FORWARD, router.route("server-a", position(-32)).action());
+    assertEquals(PREPARE_AND_WITHHOLD, router.route("server-a", position(0)).action());
+    router.blockCrossing();
+
+    assertEquals(WITHHOLD_CROSSING, router.route("server-a", position(24)).action());
     assertEquals(0, router.bufferedPackets().size());
+    assertEquals(FORWARD, router.route("server-a", position(-8)).action());
+    assertEquals(PREPARE, router.route("server-a", position(-7)).action());
   }
 
   @Test
@@ -100,8 +114,8 @@ public class ServerboundMovementRouterTest {
     router.clearBuffer();
     now.set(11);
 
-    assertEquals(PREPARE_NOT_READY, router.route("server-a", position(0.1)).action());
-    assertEquals(0, router.bufferedPackets().size());
+    assertEquals(PREPARE_AND_WITHHOLD, router.route("server-a", position(0.1)).action());
+    assertEquals(1, router.bufferedPackets().size());
   }
 
   @Test
@@ -165,6 +179,7 @@ public class ServerboundMovementRouterTest {
         [world]
         level-name = "world"
         dimension = "minecraft:overworld"
+        compatibility-id = "test-v1"
 
         [servers.server-a]
         control-address = "127.0.0.1:25576"
