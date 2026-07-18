@@ -31,7 +31,7 @@ import org.checkerframework.checker.nullness.qual.Nullable;
  */
 public final class HandoffControlPlane {
 
-  public static final int PROTOCOL_VERSION = 3;
+  public static final int PROTOCOL_VERSION = 4;
   private static final Logger logger = LogManager.getLogger(HandoffControlPlane.class);
 
   private final LivePlayerSessionStore sessions;

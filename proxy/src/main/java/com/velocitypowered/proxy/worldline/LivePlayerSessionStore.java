@@ -57,7 +57,7 @@ public final class LivePlayerSessionStore {
           || current.handoffPhase() != HandoffPhase.ACTIVE_SOURCE)) {
         return current;
       }
-      return new LivePlayerSession(playerUuid, clientConnectionId, serverId, 0, null,
+      return new LivePlayerSession(playerUuid, clientConnectionId, serverId, 0, 0, null,
           HandoffPhase.ACTIVE_SOURCE);
     });
     phaseEnteredNanos.putIfAbsent(playerUuid, System.nanoTime());
@@ -124,7 +124,7 @@ public final class LivePlayerSessionStore {
       }
       LivePlayerSession next = new LivePlayerSession(current.playerUuid(),
           current.clientConnectionId(), current.authoritativeServerId(), current.playerSessionEpoch(),
-          transferId, HandoffPhase.PREPARING_DESTINATION);
+          current.routeGeneration(), transferId, HandoffPhase.PREPARING_DESTINATION);
       return apply("beginTransfer", current, next, result);
     });
     return result.get();
@@ -204,7 +204,7 @@ public final class LivePlayerSessionStore {
       }
       LivePlayerSession next = new LivePlayerSession(current.playerUuid(),
           current.clientConnectionId(), current.authoritativeServerId(), current.playerSessionEpoch(),
-          null, HandoffPhase.ACTIVE_SOURCE);
+          current.routeGeneration(), null, HandoffPhase.ACTIVE_SOURCE);
       return apply("abortTransfer", current, next, result);
     });
     return result.get();
@@ -242,8 +242,8 @@ public final class LivePlayerSessionStore {
         return current;
       }
       LivePlayerSession next = new LivePlayerSession(current.playerUuid(),
-          current.clientConnectionId(), destinationServerId, expectedEpoch + 1, transferId,
-          HandoffPhase.COMMITTED);
+          current.clientConnectionId(), destinationServerId, expectedEpoch + 1,
+          current.routeGeneration() + 1, transferId, HandoffPhase.COMMITTED);
       return apply("commit", current, next, result);
     });
     return result.get();
@@ -273,7 +273,7 @@ public final class LivePlayerSessionStore {
       }
       LivePlayerSession next = new LivePlayerSession(current.playerUuid(),
           current.clientConnectionId(), current.authoritativeServerId(), current.playerSessionEpoch(),
-          transferId, nextPhase);
+          current.routeGeneration(), transferId, nextPhase);
       return apply(nextPhase.name(), current, next, result);
     });
     return result.get();

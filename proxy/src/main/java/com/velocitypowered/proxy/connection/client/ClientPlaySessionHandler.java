@@ -756,10 +756,11 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
       final String destinationServerId, final BoundaryCrossingDetector.Decision decision,
       final LivePlayerSession session) {
     return new ControlEnvelope(HandoffControlPlane.PROTOCOL_VERSION, transferId,
-        player.getUniqueId(), sourceServerId, destinationServerId,
+        player.getUniqueId(), session.clientConnectionId(), sourceServerId, destinationServerId,
         decision.sourcePartitionId().orElse("unknown"),
         decision.remotePartitionId().orElse("unknown"), decision.sourcePartitionEpoch(),
-        decision.remotePartitionEpoch(), session.playerSessionEpoch(), 1);
+        decision.remotePartitionEpoch(), session.playerSessionEpoch(), 1,
+        session.routeGeneration());
   }
 
   private void logWorldlineCrossingWithheld(final String serverId,

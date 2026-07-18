@@ -47,6 +47,14 @@ public class HandoffControlPlaneTest {
   Path tempDir;
 
   @Test
+  void envelopeCarriesClientConnectionAndRouteGeneration() {
+    ControlEnvelope envelope = envelope();
+
+    assertEquals(CLIENT, envelope.clientConnectionId());
+    assertEquals(0, envelope.routeGeneration());
+  }
+
+  @Test
   void scriptedPrepareAbortRoundTrip() {
     LivePlayerSessionStore sessions = new LivePlayerSessionStore();
     sessions.putActive(PLAYER, CLIENT, "server-a");
@@ -106,8 +114,8 @@ public class HandoffControlPlaneTest {
     LivePlayerSessionStore sessions = new LivePlayerSessionStore();
     sessions.putActive(PLAYER, CLIENT, "server-a");
     HandoffControlPlane control = new HandoffControlPlane(sessions);
-    ControlEnvelope envelope = new ControlEnvelope(2, TRANSFER, PLAYER, "server-a", "server-b",
-        "west", "east", 0, 0, 0, 0);
+    ControlEnvelope envelope = new ControlEnvelope(2, TRANSFER, PLAYER, CLIENT,
+        "server-a", "server-b", "west", "east", 0, 0, 0, 0, 0);
 
     assertThrows(IllegalArgumentException.class, () -> control.prepare(envelope, TARGET));
   }
@@ -119,7 +127,7 @@ public class HandoffControlPlaneTest {
     HandoffControlPlane control = new HandoffControlPlane(sessions);
     control.configure(partitionMap());
     ControlEnvelope stale = new ControlEnvelope(HandoffControlPlane.PROTOCOL_VERSION, TRANSFER,
-        PLAYER, "server-a", "server-b", "west", "east", 0, 1, 0, 0);
+        PLAYER, CLIENT, "server-a", "server-b", "west", "east", 0, 1, 0, 0, 0);
 
     assertEquals(REJECTED_PARTITION_EPOCH, control.prepare(stale, TARGET).status());
     assertEquals(HandoffPhase.ACTIVE_SOURCE, sessions.get(PLAYER).orElseThrow().handoffPhase());
@@ -132,7 +140,7 @@ public class HandoffControlPlaneTest {
     HandoffControlPlane control = new HandoffControlPlane(sessions);
     control.configure(partitionMap());
     ControlEnvelope stale = new ControlEnvelope(HandoffControlPlane.PROTOCOL_VERSION, TRANSFER,
-        PLAYER, "server-a", "server-b", "west", "east", 1, 0, 0, 0);
+        PLAYER, CLIENT, "server-a", "server-b", "west", "east", 1, 0, 0, 0, 0);
 
     assertEquals(REJECTED_PARTITION_EPOCH, control.prepare(stale, TARGET).status());
     assertEquals(HandoffPhase.ACTIVE_SOURCE, sessions.get(PLAYER).orElseThrow().handoffPhase());
@@ -238,12 +246,12 @@ public class HandoffControlPlaneTest {
 
   private static ControlEnvelope envelope() {
     return new ControlEnvelope(HandoffControlPlane.PROTOCOL_VERSION, TRANSFER, PLAYER,
-        "server-a", "server-b", "west", "east", 0, 0, 0, 0);
+        CLIENT, "server-a", "server-b", "west", "east", 0, 0, 0, 0, 0);
   }
 
   private static ControlEnvelope envelopeWithEpochs() {
     return new ControlEnvelope(HandoffControlPlane.PROTOCOL_VERSION, TRANSFER, PLAYER,
-        "server-a", "server-b", "west", "east", 1, 1, 0, 0);
+        CLIENT, "server-a", "server-b", "west", "east", 1, 1, 0, 0, 0);
   }
 
   private record FailureRun(LivePlayerSessionStore.TransitionResult result,

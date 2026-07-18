@@ -39,6 +39,7 @@ public class WorldlineControlTransportTest {
 
   private static final UUID TRANSFER = UUID.fromString("00000000-0000-0000-0000-000000000031");
   private static final UUID PLAYER = UUID.fromString("00000000-0000-0000-0000-000000000032");
+  private static final UUID CLIENT = UUID.fromString("00000000-0000-0000-0000-000000000033");
   private static final PrepareTarget TARGET = new PrepareTarget("WorldlineTest", "world",
       "minecraft:overworld", "test-v1", 8, 64, 0, 1);
 
@@ -133,7 +134,7 @@ public class WorldlineControlTransportTest {
 
   private static ControlEnvelope envelope() {
     return new ControlEnvelope(HandoffControlPlane.PROTOCOL_VERSION, TRANSFER, PLAYER,
-        "server-a", "server-b", "west", "east", 1, 1, 4, 9);
+        CLIENT, "server-a", "server-b", "west", "east", 1, 1, 4, 9, 7);
   }
 
   private enum Response {
@@ -202,6 +203,7 @@ public class WorldlineControlTransportTest {
       commands.add(input.readUTF());
       UUID transferId = readUuid(input);
       UUID playerId = readUuid(input);
+      UUID clientConnectionId = readUuid(input);
       String sourceServer = input.readUTF();
       String destinationServer = input.readUTF();
       String sourcePartition = input.readUTF();
@@ -209,8 +211,9 @@ public class WorldlineControlTransportTest {
       String destinationPartition = input.readUTF();
       long destinationPartitionEpoch = input.readLong();
       ControlEnvelope received = new ControlEnvelope(protocolVersion, transferId, playerId,
-          sourceServer, destinationServer, sourcePartition, destinationPartition,
-          sourcePartitionEpoch, destinationPartitionEpoch, input.readLong(), input.readLong());
+          clientConnectionId, sourceServer, destinationServer, sourcePartition,
+          destinationPartition, sourcePartitionEpoch, destinationPartitionEpoch,
+          input.readLong(), input.readLong(), input.readLong());
       envelopes.add(received);
       if (input.readBoolean()) {
         targets.add(new PrepareTarget(input.readUTF(), input.readUTF(), input.readUTF(),
@@ -235,10 +238,12 @@ public class WorldlineControlTransportTest {
       output.write(responsePayload);
       ControlEnvelope echoed = response == Response.WRONG_TRANSFER
           ? new ControlEnvelope(received.protocolVersion(), UUID.randomUUID(),
-              received.playerUuid(), received.sourceServerId(), received.destinationServerId(),
-              received.sourcePartitionId(), received.destinationPartitionId(),
+              received.playerUuid(), received.clientConnectionId(), received.sourceServerId(),
+              received.destinationServerId(), received.sourcePartitionId(),
+              received.destinationPartitionId(),
               received.sourcePartitionEpoch(), received.destinationPartitionEpoch(),
-              received.playerSessionEpoch(), received.playerStateVersion())
+              received.playerSessionEpoch(), received.playerStateVersion(),
+              received.routeGeneration())
           : received;
       writeEnvelope(output, echoed);
       output.writeUTF("server-b");
@@ -274,6 +279,7 @@ public class WorldlineControlTransportTest {
       output.writeInt(envelope.protocolVersion());
       writeUuid(output, envelope.transferId());
       writeUuid(output, envelope.playerUuid());
+      writeUuid(output, envelope.clientConnectionId());
       output.writeUTF(envelope.sourceServerId());
       output.writeUTF(envelope.destinationServerId());
       output.writeUTF(envelope.sourcePartitionId());
@@ -282,6 +288,7 @@ public class WorldlineControlTransportTest {
       output.writeLong(envelope.destinationPartitionEpoch());
       output.writeLong(envelope.playerSessionEpoch());
       output.writeLong(envelope.playerStateVersion());
+      output.writeLong(envelope.routeGeneration());
     }
   }
 

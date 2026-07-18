@@ -44,7 +44,7 @@ public final class HandoffControlPlaneDemo {
     HandoffControlPlane control = new HandoffControlPlane(sessions);
     control.configure(StaticPartitionMap.read(Path.of(args[0])));
     ControlEnvelope envelope = new ControlEnvelope(HandoffControlPlane.PROTOCOL_VERSION, transfer,
-        player, "server-a", "server-b", "west", "east", 1, 1, 0, 0);
+        player, client, "server-a", "server-b", "west", "east", 1, 1, 0, 0, 0);
 
     System.out.printf("initial phase=%s authority=%s epoch=%d transfer=%s%n",
         sessions.get(player).orElseThrow().handoffPhase(),

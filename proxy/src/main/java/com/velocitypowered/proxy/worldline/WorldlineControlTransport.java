@@ -76,6 +76,7 @@ public final class WorldlineControlTransport {
       output.writeUTF(command);
       writeUuid(output, envelope.transferId());
       writeUuid(output, envelope.playerUuid());
+      writeUuid(output, envelope.clientConnectionId());
       output.writeUTF(envelope.sourceServerId());
       output.writeUTF(envelope.destinationServerId());
       output.writeUTF(envelope.sourcePartitionId());
@@ -84,6 +85,7 @@ public final class WorldlineControlTransport {
       output.writeLong(envelope.destinationPartitionEpoch());
       output.writeLong(envelope.playerSessionEpoch());
       output.writeLong(envelope.playerStateVersion());
+      output.writeLong(envelope.routeGeneration());
       output.writeBoolean(target != null);
       if (target != null) {
         output.writeUTF(target.playerName());
@@ -114,8 +116,9 @@ public final class WorldlineControlTransport {
         throw new IOException("Truncated Worldline control response payload from " + serverId);
       }
       ControlEnvelope responseEnvelope = new ControlEnvelope(input.readInt(), readUuid(input),
-          readUuid(input), input.readUTF(), input.readUTF(), input.readUTF(), input.readUTF(),
-          input.readLong(), input.readLong(), input.readLong(), input.readLong());
+          readUuid(input), readUuid(input), input.readUTF(), input.readUTF(), input.readUTF(),
+          input.readUTF(), input.readLong(), input.readLong(), input.readLong(), input.readLong(),
+          input.readLong());
       String responseServer = input.readUTF();
       String responsePartition = input.readUTF();
       long responseEpoch = input.readLong();

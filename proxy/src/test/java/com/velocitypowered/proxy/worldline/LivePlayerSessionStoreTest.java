@@ -76,6 +76,7 @@ public class LivePlayerSessionStoreTest {
     LivePlayerSession session = store.get(PLAYER).orElseThrow();
     assertEquals(newerClient, session.clientConnectionId());
     assertEquals("server-b", session.authoritativeServerId());
+    assertEquals(0, session.routeGeneration());
     assertEquals(HandoffPhase.ACTIVE_SOURCE, session.handoffPhase());
   }
 
@@ -94,7 +95,13 @@ public class LivePlayerSessionStoreTest {
     assertEquals(APPLIED, committed.status());
     assertEquals("server-b", committed.after().orElseThrow().authoritativeServerId());
     assertEquals(1, committed.after().orElseThrow().playerSessionEpoch());
+    assertEquals(1, committed.after().orElseThrow().routeGeneration());
     assertEquals(HandoffPhase.COMMITTED, committed.after().orElseThrow().handoffPhase());
+
+    LivePlayerSessionStore.TransitionResult duplicate = store.commit(PLAYER, 0, TRANSFER,
+        "server-a", "server-b");
+    assertEquals(ALREADY_APPLIED, duplicate.status());
+    assertEquals(1, duplicate.after().orElseThrow().routeGeneration());
   }
 
   @Test
@@ -112,6 +119,7 @@ public class LivePlayerSessionStoreTest {
     LivePlayerSession unchanged = store.get(PLAYER).orElseThrow();
     assertEquals("server-a", unchanged.authoritativeServerId());
     assertEquals(0, unchanged.playerSessionEpoch());
+    assertEquals(0, unchanged.routeGeneration());
     assertEquals(TRANSFER, unchanged.activeTransferId());
     assertEquals(HandoffPhase.SNAPSHOT_STAGED, unchanged.handoffPhase());
   }

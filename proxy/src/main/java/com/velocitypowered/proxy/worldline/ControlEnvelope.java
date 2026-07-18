@@ -26,6 +26,7 @@ public record ControlEnvelope(
     int protocolVersion,
     UUID transferId,
     UUID playerUuid,
+    UUID clientConnectionId,
     String sourceServerId,
     String destinationServerId,
     String sourcePartitionId,
@@ -33,5 +34,6 @@ public record ControlEnvelope(
     long sourcePartitionEpoch,
     long destinationPartitionEpoch,
     long playerSessionEpoch,
-    long playerStateVersion) {
+    long playerStateVersion,
+    long routeGeneration) {
 }

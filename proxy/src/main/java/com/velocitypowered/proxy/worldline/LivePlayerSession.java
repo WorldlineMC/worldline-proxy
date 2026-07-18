@@ -28,6 +28,7 @@ public record LivePlayerSession(
     UUID clientConnectionId,
     String authoritativeServerId,
     long playerSessionEpoch,
+    long routeGeneration,
     @Nullable UUID activeTransferId,
     HandoffPhase handoffPhase) {
 }

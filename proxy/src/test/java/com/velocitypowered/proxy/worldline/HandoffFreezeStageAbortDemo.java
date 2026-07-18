@@ -28,7 +28,7 @@ public final class HandoffFreezeStageAbortDemo {
     HandoffControlPlane control = new HandoffControlPlane(sessions);
     control.configure(StaticPartitionMap.read(Path.of(args[0])));
     ControlEnvelope envelope = new ControlEnvelope(HandoffControlPlane.PROTOCOL_VERSION, transfer,
-        player, "server-a", "server-b", "west", "east", 1, 1, 0, 1);
+        player, client, "server-a", "server-b", "west", "east", 1, 1, 0, 1, 0);
     PrepareTarget target = control.prepareTarget(playerName, 8, 64, 0);
 
     requireApplied(control.prepare(envelope, target), "prepare");
