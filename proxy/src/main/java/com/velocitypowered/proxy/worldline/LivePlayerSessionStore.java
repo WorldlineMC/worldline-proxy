@@ -22,6 +22,7 @@ import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicReference;
+import org.checkerframework.checker.nullness.qual.Nullable;
 
 /**
  * In-memory live player-session authority table for the vertical slice.
@@ -68,6 +69,41 @@ public final class LivePlayerSessionStore {
    */
   public Optional<LivePlayerSession> get(final UUID playerUuid) {
     return Optional.ofNullable(sessions.get(playerUuid));
+  }
+
+  /**
+   * Returns whether one immutable backend connection currently owns clientbound gameplay output.
+   * Control and resume-readiness traffic is consumed before a backend reaches the play handler and
+   * therefore does not pass through this predicate.
+   */
+  public boolean mayForwardGameplay(final BackendSessionBinding binding) {
+    LivePlayerSession current = sessions.get(binding.playerUuid());
+    if (!matchesAuthority(current, binding)) {
+      return false;
+    }
+    return switch (current.handoffPhase()) {
+      case ACTIVE_SOURCE, PREPARING_DESTINATION, DESTINATION_READY -> true;
+      case ACTIVE_DESTINATION, SOURCE_CLEANED ->
+          current.activeTransferId() != null
+              && current.activeTransferId().equals(binding.transferId());
+      case SOURCE_FROZEN, SNAPSHOT_STAGED, COMMITTED -> false;
+    };
+  }
+
+  /** Allows backend-driven client transitions only outside an active splice. */
+  public boolean maySendClientTransition(final BackendSessionBinding binding) {
+    LivePlayerSession current = sessions.get(binding.playerUuid());
+    return matchesAuthority(current, binding)
+        && current.handoffPhase() == HandoffPhase.ACTIVE_SOURCE;
+  }
+
+  private static boolean matchesAuthority(final @Nullable LivePlayerSession current,
+      final BackendSessionBinding binding) {
+    return current != null
+        && current.clientConnectionId().equals(binding.clientConnectionId())
+        && current.authoritativeServerId().equals(binding.backendServerId())
+        && current.playerSessionEpoch() == binding.playerSessionEpoch()
+        && current.routeGeneration() == binding.routeGeneration();
   }
 
   /**
@@ -173,6 +209,40 @@ public final class LivePlayerSessionStore {
       final UUID transferId) {
     return phase(playerUuid, expectedEpoch, transferId, HandoffPhase.ACTIVE_DESTINATION,
         HandoffPhase.SOURCE_CLEANED);
+  }
+
+  /** Retires terminal transfer identity while preserving destination authority and fences. */
+  public TransitionResult retireTransfer(final UUID playerUuid, final long expectedEpoch,
+      final UUID transferId, final String expectedDestinationServerId) {
+    AtomicReference<TransitionResult> result = new AtomicReference<>();
+    sessions.compute(playerUuid, (ignored, current) -> {
+      if (current == null) {
+        result.set(TransitionResult.missing());
+        return null;
+      }
+      if (current.playerSessionEpoch() != expectedEpoch) {
+        result.set(TransitionResult.rejectedStaleEpoch(current));
+        return current;
+      }
+      if (current.activeTransferId() == null
+          && current.authoritativeServerId().equals(expectedDestinationServerId)
+          && current.handoffPhase() == HandoffPhase.ACTIVE_SOURCE) {
+        result.set(TransitionResult.alreadyApplied(current));
+        return current;
+      }
+      if (!transferId.equals(current.activeTransferId())
+          || !current.authoritativeServerId().equals(expectedDestinationServerId)
+          || current.handoffPhase() != HandoffPhase.SOURCE_CLEANED
+          || !current.handoffPhase().canTransitionTo(HandoffPhase.ACTIVE_SOURCE)) {
+        result.set(TransitionResult.rejectedMismatch(current));
+        return current;
+      }
+      LivePlayerSession next = new LivePlayerSession(current.playerUuid(),
+          current.clientConnectionId(), current.authoritativeServerId(), current.playerSessionEpoch(),
+          current.routeGeneration(), null, HandoffPhase.ACTIVE_SOURCE);
+      return apply("retireTransfer", current, next, result);
+    });
+    return result.get();
   }
 
   /**

@@ -94,6 +94,7 @@ import com.velocitypowered.proxy.protocol.packet.config.StartUpdatePacket;
 import com.velocitypowered.proxy.protocol.packet.title.GenericTitlePacket;
 import com.velocitypowered.proxy.protocol.util.ByteBufDataOutput;
 import com.velocitypowered.proxy.server.VelocityRegisteredServer;
+import com.velocitypowered.proxy.worldline.WorldlineResumeContext;
 import com.velocitypowered.proxy.tablist.InternalTabList;
 import com.velocitypowered.proxy.tablist.KeyedVelocityTabList;
 import com.velocitypowered.proxy.tablist.VelocityTabList;
@@ -179,6 +180,7 @@ public class ConnectedPlayer implements MinecraftConnectionAssociation, Player, 
   private final boolean onlineMode;
   private @Nullable VelocityServerConnection connectedServer;
   private @Nullable VelocityServerConnection connectionInFlight;
+  private @Nullable VelocityServerConnection worldlineRetainedSource;
   private @Nullable PlayerSettings settings;
   private @Nullable ModInfo modInfo;
   private final Set<VelocityBossBarImplementation> bossBars = new HashSet<>();
@@ -917,6 +919,78 @@ public class ConnectedPlayer implements MinecraftConnectionAssociation, Player, 
     }
   }
 
+  /** Opens an internal, transfer-scoped M5 destination connection without API switch events. */
+  public CompletableFuture<VelocityServerConnection> requestWorldlineDestination(
+      final WorldlineResumeContext context) {
+    return CompletableFuture.supplyAsync(() -> {
+      Preconditions.checkState(connectionInFlight == null,
+          "A backend connection is already in flight");
+      Preconditions.checkState(connectedServer != null,
+          "An M5 destination requires a connected source");
+      Preconditions.checkArgument(context.playerId().equals(getUniqueId()),
+          "M5 resume player does not match");
+      Preconditions.checkArgument(context.sourceServerId().equals(
+              connectedServer.getServerInfo().getName()),
+          "M5 resume source does not match");
+      RegisteredServer registered = server.getServer(context.destinationServerId())
+          .orElseThrow(() -> new IllegalArgumentException(
+              "Unknown M5 destination " + context.destinationServerId()));
+      Preconditions.checkArgument(registered instanceof VelocityRegisteredServer,
+          "M5 destination is not a Velocity server");
+      VelocityServerConnection destination = new VelocityServerConnection(
+          (VelocityRegisteredServer) registered, connectedServer.getServer(), this, server,
+          context);
+      connectionInFlight = destination;
+      return destination;
+    }, connection.eventLoop()).thenCompose(destination -> destination.connect()
+        .thenApply(result -> {
+          if (!result.isSuccessful()) {
+            throw new CompletionException(new IllegalStateException(
+                "M5 destination connection failed: " + result.getStatus()));
+          }
+          return destination;
+        }).whenCompleteAsync((ignored, failure) -> {
+          if (failure != null && connectionInFlight == destination) {
+            destination.disconnect();
+            resetInFlightConnection();
+          }
+        }, connection.eventLoop()));
+  }
+
+  /** Installs a ready M5 destination as the route while leaving the source transport open. */
+  public VelocityServerConnection installWorldlineDestination(
+      final VelocityServerConnection destination) {
+    Preconditions.checkState(connection.eventLoop().inEventLoop(),
+        "M5 route installation must run on the client event loop");
+    Preconditions.checkState(connectionInFlight == destination,
+        "M5 destination is not the in-flight connection");
+    Preconditions.checkState(destination.getWorldlineResumeContext().isPresent(),
+        "M5 destination lacks resume authority");
+    Preconditions.checkState(destination.hasCompletedJoin(),
+        "M5 destination is not ready");
+    VelocityServerConnection source = Preconditions.checkNotNull(connectedServer,
+        "M5 source disappeared before route installation");
+    Preconditions.checkState(worldlineRetainedSource == null,
+        "An M5 source connection is already retained");
+    worldlineRetainedSource = source;
+    setConnectedServer(destination);
+    destination.getServer().addPlayer(this);
+    return source;
+  }
+
+  /** Closes the M5 source after cleanup, whether route installation already occurred or not. */
+  public void disconnectWorldlineSourceAfterCleanup(final VelocityServerConnection source) {
+    Preconditions.checkState(connection.eventLoop().inEventLoop(),
+        "M5 source retirement must run on the client event loop");
+    if (worldlineRetainedSource == source) {
+      worldlineRetainedSource = null;
+    } else {
+      Preconditions.checkState(worldlineRetainedSource == null && connectedServer == source,
+          "M5 source cleanup connection does not match");
+    }
+    source.disconnect();
+  }
+
   public void sendLegacyForgeHandshakeResetPacket() {
     connectionPhase.resetConnectionPhase(this);
   }
@@ -941,6 +1015,11 @@ public class ConnectedPlayer implements MinecraftConnectionAssociation, Player, 
     }
     if (connectedServer != null) {
       connectedServer.disconnect();
+    }
+    if (worldlineRetainedSource != null && worldlineRetainedSource != connectedServer
+        && worldlineRetainedSource != connectionInFlight) {
+      worldlineRetainedSource.disconnect();
+      worldlineRetainedSource = null;
     }
 
     Optional<Player> connectedPlayer = server.getPlayer(this.getUniqueId());
@@ -1323,7 +1402,9 @@ public class ConnectedPlayer implements MinecraftConnectionAssociation, Player, 
    */
   public boolean forwardKeepAlive(final KeepAlivePacket packet) {
     if (!this.sendKeepAliveToBackend(connectedServer, packet)) {
-      return this.sendKeepAliveToBackend(connectionInFlight, packet);
+      if (!this.sendKeepAliveToBackend(connectionInFlight, packet)) {
+        return this.sendKeepAliveToBackend(worldlineRetainedSource, packet);
+      }
     }
     return false;
   }

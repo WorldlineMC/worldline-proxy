@@ -42,7 +42,7 @@ public enum HandoffPhase {
       case SNAPSHOT_STAGED -> next == COMMITTED || next == ACTIVE_SOURCE;
       case COMMITTED -> next == ACTIVE_DESTINATION;
       case ACTIVE_DESTINATION -> next == SOURCE_CLEANED;
-      case SOURCE_CLEANED -> false;
+      case SOURCE_CLEANED -> next == ACTIVE_SOURCE;
     };
   }
 }

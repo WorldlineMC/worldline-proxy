@@ -46,6 +46,8 @@ import com.velocitypowered.proxy.protocol.packet.PluginMessagePacket;
 import com.velocitypowered.proxy.protocol.packet.ServerLoginPacket;
 import com.velocitypowered.proxy.protocol.util.ByteBufDataOutput;
 import com.velocitypowered.proxy.server.VelocityRegisteredServer;
+import com.velocitypowered.proxy.worldline.BackendSessionBinding;
+import com.velocitypowered.proxy.worldline.WorldlineResumeContext;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.ChannelFutureListener;
@@ -66,6 +68,8 @@ public class VelocityServerConnection implements MinecraftConnectionAssociation,
   private final @Nullable VelocityRegisteredServer previousServer;
   private final ConnectedPlayer proxyPlayer;
   private final VelocityServer server;
+  private final @Nullable WorldlineResumeContext worldlineResumeContext;
+  private @Nullable BackendSessionBinding worldlineBinding;
   private @Nullable MinecraftConnection connection;
   private boolean hasCompletedJoin = false;
   private boolean gracefulDisconnect = false;
@@ -84,10 +88,44 @@ public class VelocityServerConnection implements MinecraftConnectionAssociation,
   public VelocityServerConnection(VelocityRegisteredServer registeredServer,
       @Nullable VelocityRegisteredServer previousServer,
       ConnectedPlayer proxyPlayer, VelocityServer server) {
+    this(registeredServer, previousServer, proxyPlayer, server, null);
+  }
+
+  /**
+   * Initializes a connection with explicit transfer-scoped M5 resume authority.
+   *
+   * @param registeredServer the destination server
+   * @param previousServer the source server
+   * @param proxyPlayer the player connecting to the destination
+   * @param server the Velocity proxy instance
+   * @param worldlineResumeContext immutable M5 resume fences, or null for ordinary/M1 connections
+   */
+  public VelocityServerConnection(VelocityRegisteredServer registeredServer,
+      @Nullable VelocityRegisteredServer previousServer,
+      ConnectedPlayer proxyPlayer, VelocityServer server,
+      @Nullable WorldlineResumeContext worldlineResumeContext) {
     this.registeredServer = registeredServer;
     this.previousServer = previousServer;
     this.proxyPlayer = proxyPlayer;
     this.server = server;
+    this.worldlineResumeContext = worldlineResumeContext;
+    if (worldlineResumeContext != null) {
+      Preconditions.checkArgument(previousServer != null,
+          "An M5 resume connection requires a source server");
+      Preconditions.checkArgument(worldlineResumeContext.playerId().equals(proxyPlayer.getUniqueId()),
+          "M5 resume player does not match the connection");
+      Preconditions.checkArgument(worldlineResumeContext.sourceServerId().equals(
+              previousServer.getServerInfo().getName()),
+          "M5 resume source does not match the previous server");
+      Preconditions.checkArgument(worldlineResumeContext.destinationServerId().equals(
+              registeredServer.getServerInfo().getName()),
+          "M5 resume destination does not match the requested server");
+      this.worldlineBinding = new BackendSessionBinding(worldlineResumeContext.playerId(),
+          worldlineResumeContext.clientConnectionId(),
+          worldlineResumeContext.destinationServerId(),
+          worldlineResumeContext.committedPlayerEpoch(),
+          worldlineResumeContext.routeGeneration(), worldlineResumeContext.transferId());
+    }
   }
 
   /**
@@ -132,9 +170,30 @@ public class VelocityServerConnection implements MinecraftConnectionAssociation,
   }
 
   boolean isWorldlineResume() {
-    return previousServer != null
+    return worldlineResumeContext != null || (previousServer != null
         && registeredServer.getServerInfo().getName().equals(
-            System.getProperty("worldline.splice-target", ""));
+            System.getProperty("worldline.splice-target", "")));
+  }
+
+  public Optional<WorldlineResumeContext> getWorldlineResumeContext() {
+    return Optional.ofNullable(worldlineResumeContext);
+  }
+
+  /** Installs the immutable M5 authority binding for this backend connection. */
+  public void installWorldlineBinding(final BackendSessionBinding binding) {
+    Preconditions.checkArgument(binding.playerUuid().equals(proxyPlayer.getUniqueId()),
+        "Worldline binding player does not match the connection");
+    Preconditions.checkArgument(binding.backendServerId().equals(
+            registeredServer.getServerInfo().getName()),
+        "Worldline binding server does not match the connection");
+    Preconditions.checkState(worldlineBinding == null || worldlineBinding.equals(binding),
+        "A backend connection cannot change its Worldline authority binding");
+    worldlineBinding = binding;
+  }
+
+  /** Returns the immutable M5 authority binding, when this connection participates in a splice. */
+  public Optional<BackendSessionBinding> getWorldlineBinding() {
+    return Optional.ofNullable(worldlineBinding);
   }
 
   String getPlayerRemoteAddressAsString() {
@@ -191,7 +250,10 @@ public class VelocityServerConnection implements MinecraftConnectionAssociation,
     } else {
       handshake.setServerAddress(playerVhost);
     }
-    if (isWorldlineResume() && proxyPlayer.getConnectedServer() != null
+    if (worldlineResumeContext != null) {
+      handshake.setServerAddress(worldlineResumeContext.appendToHostname(
+          handshake.getServerAddress()));
+    } else if (isWorldlineResume() && proxyPlayer.getConnectedServer() != null
         && proxyPlayer.getConnectedServer().getEntityId() != null) {
       handshake.setServerAddress(handshake.getServerAddress() + ".worldline-resume-"
           + proxyPlayer.getConnectedServer().getEntityId());

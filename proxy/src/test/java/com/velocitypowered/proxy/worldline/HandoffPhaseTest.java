@@ -36,7 +36,8 @@ public class HandoffPhaseTest {
       edge(HandoffPhase.SNAPSHOT_STAGED, HandoffPhase.COMMITTED),
       edge(HandoffPhase.SNAPSHOT_STAGED, HandoffPhase.ACTIVE_SOURCE),
       edge(HandoffPhase.COMMITTED, HandoffPhase.ACTIVE_DESTINATION),
-      edge(HandoffPhase.ACTIVE_DESTINATION, HandoffPhase.SOURCE_CLEANED));
+      edge(HandoffPhase.ACTIVE_DESTINATION, HandoffPhase.SOURCE_CLEANED),
+      edge(HandoffPhase.SOURCE_CLEANED, HandoffPhase.ACTIVE_SOURCE));
 
   @Test
   void enforcesEveryLegalAndIllegalPhasePair() {

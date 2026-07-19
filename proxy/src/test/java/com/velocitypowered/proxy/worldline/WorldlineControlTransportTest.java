@@ -70,6 +70,15 @@ public class WorldlineControlTransportTest {
   }
 
   @Test
+  void commitSourceUsesSourceOwnershipAcknowledgement() throws Exception {
+    try (FakeControlServer server = new FakeControlServer(1, Response.VALID)) {
+      transport(server.port()).send("server-a", "COMMIT_SOURCE", envelope());
+
+      assertEquals(List.of("COMMIT_SOURCE"), server.commands());
+    }
+  }
+
+  @Test
   void carriesBoundedRequestAndResponsePayloads() throws Exception {
     try (FakeControlServer server = new FakeControlServer(1, Response.VALID_PAYLOAD)) {
       byte[] response = transport(server.port()).send("server-b", "STAGE_SNAPSHOT", envelope(),
@@ -90,6 +99,18 @@ public class WorldlineControlTransportTest {
   @Test
   void rejectsMismatchedAcknowledgement() throws Exception {
     try (FakeControlServer server = new FakeControlServer(1, Response.WRONG_TRANSFER)) {
+      assertThrows(IOException.class,
+          () -> transport(server.port()).send("server-b", "PREPARE", envelope(), TARGET));
+    }
+  }
+
+  @Test
+  void rejectsMismatchedClientAndRouteAcknowledgements() throws Exception {
+    try (FakeControlServer server = new FakeControlServer(1, Response.WRONG_CLIENT)) {
+      assertThrows(IOException.class,
+          () -> transport(server.port()).send("server-b", "PREPARE", envelope(), TARGET));
+    }
+    try (FakeControlServer server = new FakeControlServer(1, Response.WRONG_ROUTE)) {
       assertThrows(IOException.class,
           () -> transport(server.port()).send("server-b", "PREPARE", envelope(), TARGET));
     }
@@ -141,6 +162,8 @@ public class WorldlineControlTransportTest {
     VALID,
     VALID_PAYLOAD,
     WRONG_TRANSFER,
+    WRONG_CLIENT,
+    WRONG_ROUTE,
     MALFORMED
   }
 
@@ -200,7 +223,8 @@ public class WorldlineControlTransportTest {
         throw new IOException("wrong request magic");
       }
       int protocolVersion = input.readInt();
-      commands.add(input.readUTF());
+      String command = input.readUTF();
+      commands.add(command);
       UUID transferId = readUuid(input);
       UUID playerId = readUuid(input);
       UUID clientConnectionId = readUuid(input);
@@ -236,18 +260,21 @@ public class WorldlineControlTransportTest {
           ? new byte[]{4, 5, 6} : new byte[0];
       output.writeInt(responsePayload.length);
       output.write(responsePayload);
-      ControlEnvelope echoed = response == Response.WRONG_TRANSFER
-          ? new ControlEnvelope(received.protocolVersion(), UUID.randomUUID(),
-              received.playerUuid(), received.clientConnectionId(), received.sourceServerId(),
-              received.destinationServerId(), received.sourcePartitionId(),
-              received.destinationPartitionId(),
-              received.sourcePartitionEpoch(), received.destinationPartitionEpoch(),
-              received.playerSessionEpoch(), received.playerStateVersion(),
-              received.routeGeneration())
-          : received;
+      ControlEnvelope echoed = switch (response) {
+        case WRONG_TRANSFER -> changedEnvelope(received, UUID.randomUUID(),
+            received.clientConnectionId(), received.routeGeneration());
+        case WRONG_CLIENT -> changedEnvelope(received, received.transferId(), UUID.randomUUID(),
+            received.routeGeneration());
+        case WRONG_ROUTE -> changedEnvelope(received, received.transferId(),
+            received.clientConnectionId(), received.routeGeneration() + 1);
+        default -> received;
+      };
       writeEnvelope(output, echoed);
-      output.writeUTF("server-b");
-      output.writeUTF("east");
+      boolean sourceCommand = command.equals("CHECK_PREPARE")
+          || command.equals("FREEZE_SOURCE") || command.equals("ABORT_SOURCE")
+          || command.equals("COMMIT_SOURCE") || command.equals("CLEAN_SOURCE");
+      output.writeUTF(sourceCommand ? "server-a" : "server-b");
+      output.writeUTF(sourceCommand ? "west" : "east");
       output.writeLong(1);
       output.flush();
     }
@@ -289,6 +316,16 @@ public class WorldlineControlTransportTest {
       output.writeLong(envelope.playerSessionEpoch());
       output.writeLong(envelope.playerStateVersion());
       output.writeLong(envelope.routeGeneration());
+    }
+
+    private static ControlEnvelope changedEnvelope(final ControlEnvelope received,
+        final UUID transferId, final UUID clientId, final long routeGeneration) {
+      return new ControlEnvelope(received.protocolVersion(), transferId,
+          received.playerUuid(), clientId, received.sourceServerId(),
+          received.destinationServerId(), received.sourcePartitionId(),
+          received.destinationPartitionId(), received.sourcePartitionEpoch(),
+          received.destinationPartitionEpoch(), received.playerSessionEpoch(),
+          received.playerStateVersion(), routeGeneration);
     }
   }
 

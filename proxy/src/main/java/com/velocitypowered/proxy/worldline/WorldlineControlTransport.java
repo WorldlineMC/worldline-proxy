@@ -123,14 +123,14 @@ public final class WorldlineControlTransport {
       String responsePartition = input.readUTF();
       long responseEpoch = input.readLong();
       if (!accepted) {
-        throw new IOException(serverId + " rejected " + command + ": " + detail);
+        throw new ControlRejectedException(serverId + " rejected " + command + ": " + detail);
       }
       if (!responseEnvelope.equals(envelope) || !responseServer.equals(serverId)) {
         throw new IOException("Mismatched Worldline control acknowledgement from " + serverId);
       }
       boolean sourceCommand = command.equals("CHECK_PREPARE")
           || command.equals("FREEZE_SOURCE") || command.equals("ABORT_SOURCE")
-          || command.equals("CLEAN_SOURCE");
+          || command.equals("COMMIT_SOURCE") || command.equals("CLEAN_SOURCE");
       String expectedPartition = sourceCommand
           ? envelope.sourcePartitionId() : envelope.destinationPartitionId();
       long expectedEpoch = sourceCommand
@@ -150,5 +150,13 @@ public final class WorldlineControlTransport {
 
   private static UUID readUuid(final DataInputStream input) throws IOException {
     return new UUID(input.readLong(), input.readLong());
+  }
+
+  /** A peer supplied a correlated, definite rejection rather than an ambiguous I/O failure. */
+  public static final class ControlRejectedException extends IOException {
+
+    public ControlRejectedException(final String message) {
+      super(message);
+    }
   }
 }

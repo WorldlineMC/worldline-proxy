@@ -62,6 +62,7 @@ import com.velocitypowered.proxy.protocol.packet.RemovePlayerInfoPacket;
 import com.velocitypowered.proxy.protocol.packet.RemoveResourcePackPacket;
 import com.velocitypowered.proxy.protocol.packet.ResourcePackRequestPacket;
 import com.velocitypowered.proxy.protocol.packet.ResourcePackResponsePacket;
+import com.velocitypowered.proxy.protocol.packet.RespawnPacket;
 import com.velocitypowered.proxy.protocol.packet.ServerDataPacket;
 import com.velocitypowered.proxy.protocol.packet.TabCompleteResponsePacket;
 import com.velocitypowered.proxy.protocol.packet.TransferPacket;
@@ -78,6 +79,8 @@ import io.netty.handler.timeout.ReadTimeoutException;
 import java.net.InetSocketAddress;
 import java.util.regex.Pattern;
 import net.kyori.adventure.key.Key;
+import net.kyori.adventure.text.Component;
+import net.kyori.adventure.text.format.NamedTextColor;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -120,7 +123,10 @@ public class BackendPlaySessionHandler implements MinecraftSessionHandler {
 
   @Override
   public void activated() {
-    serverConn.getServer().addPlayer(serverConn.getPlayer());
+    if (serverConn.getWorldlineResumeContext().isEmpty()
+        || serverConn.getPlayer().getConnectedServer() == serverConn) {
+      serverConn.getServer().addPlayer(serverConn.getPlayer());
+    }
 
     MinecraftConnection serverMc = serverConn.ensureConnected();
     if (server.getConfiguration().isBungeePluginChannelEnabled()) {
@@ -138,6 +144,11 @@ public class BackendPlaySessionHandler implements MinecraftSessionHandler {
       serverConn.disconnect();
       return true;
     }
+    if (serverConn.getWorldlineBinding()
+        .filter(binding -> !server.getWorldlineLiveSessions().mayForwardGameplay(binding))
+        .isPresent()) {
+      return true;
+    }
     return false;
   }
 
@@ -149,6 +160,10 @@ public class BackendPlaySessionHandler implements MinecraftSessionHandler {
 
   @Override
   public boolean handle(StartUpdatePacket packet) {
+    if (forbidsWorldlineClientTransition()) {
+      disconnectUnexpectedWorldlineTransition("configuration start");
+      return true;
+    }
     MinecraftConnection smc = serverConn.ensureConnected();
     smc.setAutoReading(false);
     // Even when not auto reading messages are still decoded. Decode them with the correct state
@@ -156,6 +171,29 @@ public class BackendPlaySessionHandler implements MinecraftSessionHandler {
     smc.getChannel().pipeline().get(MinecraftDecoder.class).setState(StateRegistry.CONFIG);
     serverConn.getPlayer().switchToConfigState();
     return true;
+  }
+
+  @Override
+  public boolean handle(RespawnPacket packet) {
+    if (forbidsWorldlineClientTransition()) {
+      disconnectUnexpectedWorldlineTransition("respawn");
+      return true;
+    }
+    return false;
+  }
+
+  private boolean forbidsWorldlineClientTransition() {
+    return serverConn.getWorldlineBinding()
+        .filter(binding -> !server.getWorldlineLiveSessions().maySendClientTransition(binding))
+        .isPresent();
+  }
+
+  private void disconnectUnexpectedWorldlineTransition(final String packetType) {
+    playerSessionHandler.recordWorldlineClientTransitionPacket();
+    logger.error("Worldline backend {} attempted unexpected client transition packet {}",
+        serverConn, packetType);
+    serverConn.getPlayer().disconnect(Component.translatable(
+        "velocity.error.player-connection-error", NamedTextColor.RED));
   }
 
   @Override

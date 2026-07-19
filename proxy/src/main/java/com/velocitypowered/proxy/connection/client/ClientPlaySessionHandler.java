@@ -77,12 +77,17 @@ import com.velocitypowered.proxy.protocol.util.PluginMessageUtil;
 import com.velocitypowered.proxy.util.CharacterUtil;
 import com.velocitypowered.proxy.util.except.QuietRuntimeException;
 import com.velocitypowered.proxy.worldline.BoundaryCrossingDetector;
+import com.velocitypowered.proxy.worldline.BackendSessionBinding;
 import com.velocitypowered.proxy.worldline.ControlEnvelope;
 import com.velocitypowered.proxy.worldline.HandoffControlPlane;
+import com.velocitypowered.proxy.worldline.HandoffPhase;
+import com.velocitypowered.proxy.worldline.HandoffReplayBuffer;
+import com.velocitypowered.proxy.worldline.HandoffReplayGate;
 import com.velocitypowered.proxy.worldline.LivePlayerSession;
 import com.velocitypowered.proxy.worldline.LivePlayerSessionStore;
 import com.velocitypowered.proxy.worldline.PrepareTarget;
 import com.velocitypowered.proxy.worldline.ServerboundMovementRouter;
+import com.velocitypowered.proxy.worldline.WorldlineResumeContext;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufUtil;
 import io.netty.buffer.Unpooled;
@@ -95,6 +100,8 @@ import java.util.Queue;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import net.kyori.adventure.key.Key;
@@ -122,6 +129,8 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
       Integer.getInteger("velocity.max-queued-login-plugin-messages", 1024);
 
   private static final Logger logger = LogManager.getLogger(ClientPlaySessionHandler.class);
+  private static final int WORLDLINE_POST_COMMIT_TIMEOUT_SECONDS =
+      boundedIntegerProperty("worldline.m5.post-commit-timeout-seconds", 10, 1, 60);
 
   private final ConnectedPlayer player;
   private boolean spawned = false;
@@ -143,6 +152,13 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
       worldlinePrepareFuture;
   private @Nullable CompletableFuture<LivePlayerSessionStore.TransitionResult>
       worldlineStageFuture;
+  private @Nullable CompletableFuture<?> worldlinePostCommitFuture;
+  private @Nullable HandoffReplayBuffer<ServerboundMovePlayerPacket> worldlineReplayBuffer;
+  private final AtomicInteger worldlineClientTransitionPackets = new AtomicInteger();
+  private @Nullable ScheduledFuture<?> worldlinePostCommitDeadline;
+  private @Nullable VelocityServerConnection worldlineSourceConnection;
+  private @Nullable VelocityServerConnection worldlineDestinationConnection;
+  private boolean worldlinePostCommitTerminated;
   private boolean worldlineFreezeInProgress;
 
   private CompletableFuture<Void> configSwitchFuture;
@@ -252,7 +268,7 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
   @Override
   public boolean handle(ClientSettingsPacket packet) {
     player.setClientSettings(packet);
-    if (worldlineSourceFrozen()) {
+    if (abortFrozenGameplayInput()) {
       return true;
     }
     VelocityServerConnection serverConnection = player.getConnectedServer();
@@ -558,6 +574,13 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
     if (worldlineMovementRouter == null) {
       return false;
     }
+    if (HandoffReplayGate.mustBuffer(worldlineCurrentPhase(), worldlineReplayBuffer != null)) {
+      HandoffReplayBuffer.AppendResult appended = worldlineReplayBuffer.append(packet);
+      if (appended != HandoffReplayBuffer.AppendResult.APPENDED && worldlineEnvelope != null) {
+        failWorldlinePostCommit(worldlineEnvelope, "movement replay buffer " + appended);
+      }
+      return true;
+    }
     VelocityServerConnection serverConnection = player.getConnectedServer();
     if (serverConnection == null) {
       return false;
@@ -577,7 +600,8 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
       if (worldlineMovementRouter.bufferedPackets().size() == 1) {
         logWorldlineCrossingWithheld(serverId, decision);
       }
-      if (worldlinePrepareFuture == null && worldlineEnvelope != null) {
+      if (worldlinePrepareFuture == null && worldlinePostCommitFuture == null
+          && worldlineEnvelope != null) {
         beginWorldlineSnapshotStage(worldlineEnvelope);
       }
       return true;
@@ -618,16 +642,32 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
     if (sessions.get(player.getUniqueId()).isEmpty()) {
       sessions.putActive(player.getUniqueId(), worldlineClientConnectionId, serverId);
     }
+    LivePlayerSession liveSession = sessions.get(player.getUniqueId()).orElseThrow();
+    VelocityServerConnection sourceConnection = player.getConnectedServer();
+    if (sourceConnection == null) {
+      return;
+    }
+    BackendSessionBinding steadyBinding = new BackendSessionBinding(player.getUniqueId(),
+        liveSession.clientConnectionId(), serverId, liveSession.playerSessionEpoch(),
+        liveSession.routeGeneration(), null);
+    sourceConnection.getWorldlineBinding().ifPresentOrElse(existing ->
+        com.google.common.base.Preconditions.checkState(existing.matchesAuthority(
+            steadyBinding.playerUuid(), steadyBinding.clientConnectionId(),
+            steadyBinding.backendServerId(), steadyBinding.playerSessionEpoch(),
+            steadyBinding.routeGeneration()),
+            "Existing Worldline source binding does not match live authority"),
+        () -> sourceConnection.installWorldlineBinding(steadyBinding));
     UUID transferId = UUID.randomUUID();
     String destinationServerId = decision.remoteOwner().orElse("unknown");
     ControlEnvelope envelope = worldlineEnvelope(transferId, serverId, destinationServerId,
-        decision, sessions.get(player.getUniqueId()).orElseThrow());
+        decision, liveSession);
     double targetX = decision.action() == BoundaryCrossingDetector.Action.PREPARE
         ? decision.remoteEntryChunkX() * 16.0 + 8.0 : packet.getX();
     final PrepareTarget target = server.getWorldlineControlPlane().prepareTarget(player.getUsername(),
         targetX, packet.getY(), packet.getZ());
     CompletableFuture<LivePlayerSessionStore.TransitionResult> future = new CompletableFuture<>();
     worldlineTransferId = transferId;
+    worldlineClientTransitionPackets.set(0);
     worldlineEnvelope = envelope;
     worldlinePrepareFuture = future;
     logger.info("Worldline preparing {} handoff from {} to {}", player, serverId,
@@ -697,14 +737,283 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
       worldlineFreezeInProgress = false;
       if (failure == null && (result.status() == LivePlayerSessionStore.Status.APPLIED
           || result.status() == LivePlayerSessionStore.Status.ALREADY_APPLIED)) {
-        logger.info("Worldline staged snapshot for {} transfer {}; awaiting M5 commit",
+        logger.info("Worldline staged snapshot for {} transfer {}; starting M5 commit",
             player, envelope.transferId());
+        beginWorldlineCommit(envelope);
         return;
       }
       abortWorldlineHandoff(true);
       logger.warn("Worldline snapshot staging failed for {} transfer {}: {}", player,
           envelope.transferId(), failure == null ? result.status() : failure.getMessage());
     }, player.getConnection().eventLoop());
+  }
+
+  private void beginWorldlineCommit(final ControlEnvelope envelope) {
+    if (worldlinePostCommitFuture != null || worldlineMovementRouter == null) {
+      return;
+    }
+    VelocityServerConnection source = player.getConnectedServer();
+    if (source == null || source.getEntityId() == null) {
+      abortWorldlineHandoff(true);
+      return;
+    }
+    HandoffReplayBuffer<ServerboundMovePlayerPacket> replay = new HandoffReplayBuffer<>(
+        envelope.transferId(), envelope.playerSessionEpoch() + 1,
+        envelope.routeGeneration() + 1, 64);
+    for (ServerboundMovePlayerPacket packet : worldlineMovementRouter.drainBuffer()) {
+      if (replay.append(packet) != HandoffReplayBuffer.AppendResult.APPENDED) {
+        abortWorldlineHandoff(true);
+        return;
+      }
+    }
+    worldlineReplayBuffer = replay;
+    worldlineSourceConnection = source;
+    CompletableFuture<HandoffControlPlane.CommitBarrierResult> commit = new CompletableFuture<>();
+    worldlinePostCommitFuture = commit;
+    Thread.startVirtualThread(() -> {
+      try {
+        commit.complete(server.getWorldlineControlPlane().commit(envelope,
+            () -> worldlinePostCommitDeadline = player.getConnection().eventLoop().schedule(
+                () -> failWorldlinePostCommit(envelope, "post-commit deadline expired"),
+                WORLDLINE_POST_COMMIT_TIMEOUT_SECONDS, TimeUnit.SECONDS)));
+      } catch (Throwable throwable) {
+        commit.completeExceptionally(throwable);
+      }
+    });
+    commit.whenCompleteAsync((barrier, failure) -> {
+      if (worldlinePostCommitFuture != commit || worldlineEnvelope != envelope
+          || worldlinePostCommitTerminated) {
+        return;
+      }
+      if (failure != null || barrier.status()
+          != HandoffControlPlane.CommitBarrierStatus.COMPLETE) {
+        if (worldlineCommitted(envelope)) {
+          failWorldlinePostCommit(envelope, "commit barrier did not complete");
+        } else {
+          worldlinePostCommitFuture = null;
+          worldlineReplayBuffer = null;
+          abortWorldlineHandoff(true);
+        }
+        return;
+      }
+      WorldlineResumeContext context = new WorldlineResumeContext(
+          HandoffControlPlane.PROTOCOL_VERSION, envelope.transferId(), envelope.playerUuid(),
+          envelope.clientConnectionId(), envelope.sourceServerId(),
+          envelope.destinationServerId(), envelope.sourcePartitionId(),
+          envelope.sourcePartitionEpoch(), envelope.destinationPartitionId(),
+          envelope.destinationPartitionEpoch(), envelope.playerSessionEpoch(),
+          envelope.playerSessionEpoch() + 1, envelope.playerStateVersion(),
+          envelope.routeGeneration() + 1, source.getEntityId());
+      player.requestWorldlineDestination(context).whenCompleteAsync((destination, connectFailure) -> {
+        if (worldlinePostCommitTerminated || worldlineEnvelope != envelope) {
+          if (destination != null) {
+            destination.disconnect();
+          }
+          return;
+        }
+        if (connectFailure != null) {
+          failWorldlinePostCommit(envelope, "destination connection failed");
+          return;
+        }
+        try {
+          worldlineDestinationConnection = destination;
+          worldlineSourceConnection = player.installWorldlineDestination(destination);
+        } catch (RuntimeException routeFailure) {
+          failWorldlinePostCommit(envelope, "destination route installation failed");
+          return;
+        }
+        beginWorldlineActivation(envelope, destination);
+      }, player.getConnection().eventLoop());
+    }, player.getConnection().eventLoop());
+  }
+
+  private void beginWorldlineActivation(final ControlEnvelope envelope,
+      final VelocityServerConnection destination) {
+    CompletableFuture<LivePlayerSessionStore.TransitionResult> activation =
+        new CompletableFuture<>();
+    worldlinePostCommitFuture = activation;
+    Thread.startVirtualThread(() -> {
+      try {
+        activation.complete(server.getWorldlineControlPlane().activateDestination(envelope));
+      } catch (Throwable throwable) {
+        activation.completeExceptionally(throwable);
+      }
+    });
+    activation.whenCompleteAsync((result, failure) -> {
+      if (worldlinePostCommitFuture != activation || worldlineEnvelope != envelope
+          || worldlinePostCommitTerminated) {
+        return;
+      }
+      if (failure != null || !successful(result)) {
+        failWorldlinePostCommit(envelope, "destination activation failed");
+        return;
+      }
+      HandoffReplayBuffer<ServerboundMovePlayerPacket> replay = worldlineReplayBuffer;
+      if (replay == null) {
+        failWorldlinePostCommit(envelope, "replay state disappeared");
+        return;
+      }
+      try {
+        destination.ensureConnected().setAutoReading(true);
+        for (HandoffReplayBuffer.Entry<ServerboundMovePlayerPacket> entry : replay.drain(
+            envelope.transferId(), envelope.playerSessionEpoch() + 1,
+            envelope.routeGeneration() + 1)) {
+          ServerboundMovePlayerPacket movement = entry.value();
+          logger.info("Worldline replay transfer={} sequence={} has_position={} x={} y={} z={}",
+              envelope.transferId(), entry.sequence(), movement.hasPosition(),
+              movement.hasPosition() ? movement.getX() : Double.NaN,
+              movement.hasPosition() ? movement.getY() : Double.NaN,
+              movement.hasPosition() ? movement.getZ() : Double.NaN);
+          destination.ensureConnected().write(entry.value());
+        }
+        destination.ensureConnected().flush();
+      } catch (RuntimeException replayFailure) {
+        failWorldlinePostCommit(envelope,
+            "movement replay failed: " + replayFailure.getMessage());
+        return;
+      }
+      worldlineReplayBuffer = null;
+      beginWorldlineSourceCleanup(envelope);
+    }, player.getConnection().eventLoop());
+  }
+
+  private void beginWorldlineSourceCleanup(final ControlEnvelope envelope) {
+    CompletableFuture<LivePlayerSessionStore.TransitionResult> cleanup =
+        new CompletableFuture<>();
+    worldlinePostCommitFuture = cleanup;
+    Thread.startVirtualThread(() -> {
+      LivePlayerSessionStore.TransitionResult last = null;
+      try {
+        for (int attempt = 0; attempt < 3; attempt++) {
+          last = server.getWorldlineControlPlane().cleanSource(envelope);
+          if (successful(last)) {
+            break;
+          }
+        }
+        cleanup.complete(last);
+      } catch (Throwable throwable) {
+        cleanup.completeExceptionally(throwable);
+      }
+    });
+    cleanup.whenCompleteAsync((result, failure) -> {
+      if (worldlinePostCommitFuture != cleanup || worldlineEnvelope != envelope
+          || worldlinePostCommitTerminated) {
+        return;
+      }
+      if (failure != null || !successful(result)) {
+        failWorldlinePostCommit(envelope, "source cleanup failed");
+        return;
+      }
+      if (worldlineSourceConnection != null) {
+        player.disconnectWorldlineSourceAfterCleanup(worldlineSourceConnection);
+      }
+      LivePlayerSessionStore.TransitionResult retired = server.getWorldlineLiveSessions()
+          .retireTransfer(envelope.playerUuid(), envelope.playerSessionEpoch() + 1,
+              envelope.transferId(), envelope.destinationServerId());
+      if (!successful(retired)) {
+        failWorldlinePostCommit(envelope, "proxy transfer retirement failed");
+        return;
+      }
+      finishWorldlinePostCommit(envelope);
+    }, player.getConnection().eventLoop());
+  }
+
+  private void finishWorldlinePostCommit(final ControlEnvelope envelope) {
+    if (worldlinePostCommitDeadline != null) {
+      worldlinePostCommitDeadline.cancel(false);
+    }
+    worldlinePostCommitDeadline = null;
+    worldlinePostCommitFuture = null;
+    worldlineSourceConnection = null;
+    worldlineDestinationConnection = null;
+    worldlineTransferId = null;
+    worldlineEnvelope = null;
+    worldlinePostCommitTerminated = false;
+    logger.info("Worldline M5 completed transfer {} for {} epoch={} route_generation={} "
+            + "client_transition_packets={}",
+        envelope.transferId(), player, envelope.playerSessionEpoch() + 1,
+        envelope.routeGeneration() + 1, worldlineClientTransitionPackets.get());
+  }
+
+  /** Records a backend packet that would have exposed the internal splice to the client. */
+  public void recordWorldlineClientTransitionPacket() {
+    worldlineClientTransitionPackets.incrementAndGet();
+  }
+
+  private void failWorldlinePostCommit(final ControlEnvelope envelope, final String reason) {
+    if (worldlinePostCommitTerminated) {
+      return;
+    }
+    worldlinePostCommitTerminated = true;
+    if (worldlinePostCommitDeadline != null) {
+      worldlinePostCommitDeadline.cancel(false);
+      worldlinePostCommitDeadline = null;
+    }
+    if (worldlineReplayBuffer != null) {
+      worldlineReplayBuffer.discard();
+      worldlineReplayBuffer = null;
+    }
+    logger.error("Worldline terminal post-commit failure for {} transfer={}: {}", player,
+        envelope.transferId(), reason);
+    Thread.startVirtualThread(() -> {
+      try {
+        server.getWorldlineControlPlane().retireDestination(envelope);
+      } catch (RuntimeException retirementFailure) {
+        logger.error("Worldline destination retirement failed for {} transfer={}", player,
+            envelope.transferId(), retirementFailure);
+      }
+      boolean sourceCleaned = false;
+      for (int attempt = 0; attempt < 3; attempt++) {
+        try {
+          LivePlayerSessionStore.TransitionResult cleaned =
+              server.getWorldlineControlPlane().cleanSource(envelope);
+          if (successful(cleaned)) {
+            sourceCleaned = true;
+            break;
+          }
+        } catch (RuntimeException cleanupFailure) {
+          logger.warn("Worldline source cleanup attempt {} failed for {} transfer={}",
+              attempt + 1, player, envelope.transferId(), cleanupFailure);
+        }
+      }
+      final boolean cleanupCompleted = sourceCleaned;
+      if (!cleanupCompleted) {
+        logger.error("Worldline retained pending source cleanup for {} transfer={}", player,
+            envelope.transferId());
+      }
+      player.getConnection().eventLoop().execute(() -> {
+        if (cleanupCompleted && worldlineSourceConnection != null) {
+          player.disconnectWorldlineSourceAfterCleanup(worldlineSourceConnection);
+        }
+        player.disconnect(Component.translatable("velocity.error.player-connection-error",
+            NamedTextColor.RED));
+        if (cleanupCompleted) {
+          player.teardown();
+        }
+      });
+    });
+  }
+
+  private boolean worldlineCommitted(final ControlEnvelope envelope) {
+    return server.getWorldlineLiveSessions().get(envelope.playerUuid())
+        .map(session -> session.playerSessionEpoch() == envelope.playerSessionEpoch() + 1
+            && envelope.transferId().equals(session.activeTransferId()))
+        .orElse(false);
+  }
+
+  private static boolean successful(final LivePlayerSessionStore.TransitionResult result) {
+    return result != null && (result.status() == LivePlayerSessionStore.Status.APPLIED
+        || result.status() == LivePlayerSessionStore.Status.ALREADY_APPLIED);
+  }
+
+  private static int boundedIntegerProperty(final String name, final int defaultValue,
+      final int minimum, final int maximum) {
+    int value = Integer.getInteger(name, defaultValue);
+    if (value < minimum || value > maximum) {
+      throw new IllegalArgumentException(name + " must be between " + minimum + " and "
+          + maximum);
+    }
+    return value;
   }
 
   private void abortWorldlineHandoff() {
@@ -771,10 +1080,7 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
 
   @Override
   public void handleGeneric(MinecraftPacket packet) {
-    if (worldlineSourceFrozen()) {
-      abortWorldlineHandoff(true);
-      logger.warn("Worldline aborted frozen transfer for {} on unclassified gameplay packet {}",
-          player, packet.getClass().getSimpleName());
+    if (abortFrozenGameplayInput()) {
       return;
     }
     VelocityServerConnection serverConnection = player.getConnectedServer();
@@ -798,9 +1104,7 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
 
   @Override
   public void handleUnknown(ByteBuf buf) {
-    if (worldlineSourceFrozen()) {
-      abortWorldlineHandoff(true);
-      logger.warn("Worldline aborted frozen transfer for {} on unknown gameplay packet", player);
+    if (abortFrozenGameplayInput()) {
       return;
     }
     VelocityServerConnection serverConnection = player.getConnectedServer();
@@ -827,12 +1131,19 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
       return false;
     }
     return server.getWorldlineLiveSessions().get(player.getUniqueId())
-        .map(session -> session.handoffPhase() == com.velocitypowered.proxy.worldline.HandoffPhase.SOURCE_FROZEN
-            || session.handoffPhase() == com.velocitypowered.proxy.worldline.HandoffPhase.SNAPSHOT_STAGED)
+        .map(session -> session.handoffPhase() == HandoffPhase.SOURCE_FROZEN
+            || session.handoffPhase() == HandoffPhase.SNAPSHOT_STAGED)
         .orElse(false);
   }
 
   private boolean abortFrozenGameplayInput() {
+    if (HandoffReplayGate.rejectNonReplayable(worldlineCurrentPhase(),
+        worldlineEnvelope != null)) {
+      if (worldlineEnvelope != null) {
+        failWorldlinePostCommit(worldlineEnvelope, "non-replayable post-commit gameplay input");
+      }
+      return true;
+    }
     if (!worldlineSourceFrozen()) {
       return false;
     }
@@ -842,10 +1153,20 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
     return true;
   }
 
+  private @Nullable HandoffPhase worldlineCurrentPhase() {
+    return server.getWorldlineLiveSessions().get(player.getUniqueId())
+        .map(LivePlayerSession::handoffPhase).orElse(null);
+  }
+
   @Override
   public void disconnected() {
-    abortWorldlineHandoff();
-    server.getWorldlineLiveSessions().remove(player.getUniqueId(), worldlineClientConnectionId);
+    if (worldlineEnvelope != null && worldlineCommitted(worldlineEnvelope)) {
+      failWorldlinePostCommit(worldlineEnvelope, "client disconnected after commit");
+      return;
+    } else {
+      abortWorldlineHandoff();
+      server.getWorldlineLiveSessions().remove(player.getUniqueId(), worldlineClientConnectionId);
+    }
     player.teardown();
   }
 

@@ -32,11 +32,12 @@ import org.checkerframework.checker.nullness.qual.Nullable;
 public final class HandoffControlPlane {
 
   public static final int PROTOCOL_VERSION = 4;
+  private static final int MAX_COMMIT_ATTEMPTS = 3;
   private static final Logger logger = LogManager.getLogger(HandoffControlPlane.class);
 
   private final LivePlayerSessionStore sessions;
   private @Nullable StaticPartitionMap partitions;
-  private @Nullable WorldlineControlTransport transport;
+  private @Nullable ControlCommandSender sender;
 
   /**
    * Creates a control plane over the supplied live session store.
@@ -45,12 +46,19 @@ public final class HandoffControlPlane {
     this.sessions = sessions;
   }
 
+  HandoffControlPlane(final LivePlayerSessionStore sessions,
+      final ControlCommandSender sender) {
+    this.sessions = sessions;
+    this.sender = sender;
+  }
+
   /**
    * Enables fenced proxy-to-server control messages from the loaded slice map.
    */
   public void configure(final StaticPartitionMap partitions) {
     this.partitions = partitions;
-    this.transport = new WorldlineControlTransport(partitions);
+    WorldlineControlTransport transport = new WorldlineControlTransport(partitions);
+    this.sender = transport::send;
   }
 
   /** Builds the destination resources request from the loaded slice config. */
@@ -162,21 +170,49 @@ public final class HandoffControlPlane {
   /**
    * Commits authority to the destination.
    */
-  public LivePlayerSessionStore.TransitionResult commit(final ControlEnvelope envelope) {
+  public CommitBarrierResult commit(final ControlEnvelope envelope) {
+    return commit(envelope, () -> { });
+  }
+
+  /** Commits locally, starts the caller's terminal deadline, then drives the remote barrier. */
+  public CommitBarrierResult commit(final ControlEnvelope envelope,
+      final Runnable afterLocalCommit) {
     validateProtocol(envelope);
+    Objects.requireNonNull(afterLocalCommit, "afterLocalCommit");
     LivePlayerSessionStore.TransitionResult ownership = validateOwnership(envelope);
     if (ownership != null) {
-      return ownership;
+      return new CommitBarrierResult(CommitBarrierStatus.REJECTED_BEFORE_COMMIT, ownership,
+          envelope, false, false);
     }
     LivePlayerSessionStore.TransitionResult result = transition(HandoffPhase.COMMITTED,
         envelope, () -> sessions.commit(envelope.playerUuid(),
             envelope.playerSessionEpoch(), envelope.transferId(), envelope.sourceServerId(),
             envelope.destinationServerId()));
-    if (result.status() == LivePlayerSessionStore.Status.APPLIED
-        || result.status() == LivePlayerSessionStore.Status.ALREADY_APPLIED) {
-      send(envelope.destinationServerId(), "COMMIT", envelope);
+    if (result.status() != LivePlayerSessionStore.Status.APPLIED
+        && result.status() != LivePlayerSessionStore.Status.ALREADY_APPLIED) {
+      return new CommitBarrierResult(CommitBarrierStatus.REJECTED_BEFORE_COMMIT, result,
+          envelope, false, false);
     }
-    return result;
+    afterLocalCommit.run();
+    ControlEnvelope committed = committedEnvelope(envelope);
+    boolean destinationAcknowledged = false;
+    boolean sourceAcknowledged = false;
+    for (int attempt = 0; attempt < MAX_COMMIT_ATTEMPTS; attempt++) {
+      CommandOutcome destination = sendCommit(envelope.destinationServerId(),
+          "COMMIT_DESTINATION", committed);
+      CommandOutcome source = sendCommit(envelope.sourceServerId(), "COMMIT_SOURCE", committed);
+      destinationAcknowledged |= destination == CommandOutcome.ACKNOWLEDGED;
+      sourceAcknowledged |= source == CommandOutcome.ACKNOWLEDGED;
+      if (destination == CommandOutcome.REJECTED || source == CommandOutcome.REJECTED) {
+        return new CommitBarrierResult(CommitBarrierStatus.REJECTED_AFTER_COMMIT, result,
+            committed, destinationAcknowledged, sourceAcknowledged);
+      }
+      if (destinationAcknowledged && sourceAcknowledged) {
+        return new CommitBarrierResult(CommitBarrierStatus.COMPLETE, result, committed, true, true);
+      }
+    }
+    return new CommitBarrierResult(CommitBarrierStatus.RETRYABLE_INCOMPLETE, result, committed,
+        destinationAcknowledged, sourceAcknowledged);
   }
 
   /**
@@ -184,8 +220,9 @@ public final class HandoffControlPlane {
    */
   public LivePlayerSessionStore.TransitionResult activateDestination(final ControlEnvelope envelope) {
     validateProtocol(envelope);
+    ControlEnvelope committed = committedEnvelope(envelope);
     LivePlayerSessionStore.TransitionResult rejection = beforeServerCommand(
-        envelope.destinationServerId(), "ACTIVATE_DESTINATION", envelope);
+        envelope.destinationServerId(), "ACTIVATE_DESTINATION", committed);
     if (rejection != null) {
       return rejection;
     }
@@ -199,14 +236,30 @@ public final class HandoffControlPlane {
    */
   public LivePlayerSessionStore.TransitionResult cleanSource(final ControlEnvelope envelope) {
     validateProtocol(envelope);
+    ControlEnvelope committed = committedEnvelope(envelope);
     LivePlayerSessionStore.TransitionResult rejection = beforeServerCommand(
-        envelope.sourceServerId(), "CLEAN_SOURCE", envelope);
+        envelope.sourceServerId(), "CLEAN_SOURCE", committed);
     if (rejection != null) {
       return rejection;
     }
     return transition(HandoffPhase.SOURCE_CLEANED, envelope,
         () -> sessions.markSourceCleaned(envelope.playerUuid(), envelope.playerSessionEpoch() + 1,
             envelope.transferId()));
+  }
+
+  /** Releases destination resources after a terminal post-commit failure. */
+  public LivePlayerSessionStore.TransitionResult retireDestination(
+      final ControlEnvelope envelope) {
+    validateProtocol(envelope);
+    ControlEnvelope committed = committedEnvelope(envelope);
+    LivePlayerSessionStore.TransitionResult rejection = beforeServerCommand(
+        envelope.destinationServerId(), "RETIRE_DESTINATION", committed);
+    if (rejection != null) {
+      return rejection;
+    }
+    return sessions.get(envelope.playerUuid())
+        .map(LivePlayerSessionStore.TransitionResult::alreadyApplied)
+        .orElseGet(LivePlayerSessionStore.TransitionResult::missing);
   }
 
   private LivePlayerSessionStore.TransitionResult transition(final HandoffPhase phase,
@@ -304,7 +357,7 @@ public final class HandoffControlPlane {
   private @Nullable byte[] send(final String serverId, final String command,
       final ControlEnvelope envelope, final @Nullable PrepareTarget target,
       final byte[] payload) {
-    WorldlineControlTransport current = transport;
+    ControlCommandSender current = sender;
     if (current == null) {
       return new byte[0];
     }
@@ -315,6 +368,39 @@ public final class HandoffControlPlane {
           envelope.transferId(), serverId, e.getMessage());
       return null;
     }
+  }
+
+  private CommandOutcome sendCommit(final String serverId, final String command,
+      final ControlEnvelope envelope) {
+    ControlCommandSender current = sender;
+    if (current == null) {
+      return CommandOutcome.ACKNOWLEDGED;
+    }
+    try {
+      current.send(serverId, command, envelope, null, new byte[0]);
+      return CommandOutcome.ACKNOWLEDGED;
+    } catch (WorldlineControlTransport.ControlRejectedException e) {
+      logger.warn("Worldline commit command {} transfer={} server={} rejected: {}", command,
+          envelope.transferId(), serverId, e.getMessage());
+      return CommandOutcome.REJECTED;
+    } catch (IOException e) {
+      logger.warn("Worldline commit command {} transfer={} server={} ambiguous: {}", command,
+          envelope.transferId(), serverId, e.getMessage());
+      return CommandOutcome.RETRYABLE;
+    }
+  }
+
+  static ControlEnvelope committedEnvelope(final ControlEnvelope envelope) {
+    if (envelope.playerSessionEpoch() == Long.MAX_VALUE
+        || envelope.routeGeneration() == Long.MAX_VALUE) {
+      throw new IllegalArgumentException("Worldline epoch or generation overflow");
+    }
+    return new ControlEnvelope(envelope.protocolVersion(), envelope.transferId(),
+        envelope.playerUuid(), envelope.clientConnectionId(), envelope.sourceServerId(),
+        envelope.destinationServerId(), envelope.sourcePartitionId(),
+        envelope.destinationPartitionId(), envelope.sourcePartitionEpoch(),
+        envelope.destinationPartitionEpoch(), envelope.playerSessionEpoch() + 1,
+        envelope.playerStateVersion(), envelope.routeGeneration() + 1);
   }
 
   private void discardPreparation(final ControlEnvelope envelope) {
@@ -342,5 +428,34 @@ public final class HandoffControlPlane {
     public byte[] snapshot() {
       return snapshot.clone();
     }
+  }
+
+  /** Result of the post-local-commit two-server acknowledgement barrier. */
+  public record CommitBarrierResult(CommitBarrierStatus status,
+                                    LivePlayerSessionStore.TransitionResult transition,
+                                    ControlEnvelope committedEnvelope,
+                                    boolean destinationAcknowledged,
+                                    boolean sourceAcknowledged) {
+  }
+
+  /** Exhaustive outcomes of attempting the two-server commit barrier. */
+  public enum CommitBarrierStatus {
+    COMPLETE,
+    RETRYABLE_INCOMPLETE,
+    REJECTED_BEFORE_COMMIT,
+    REJECTED_AFTER_COMMIT
+  }
+
+  private enum CommandOutcome {
+    ACKNOWLEDGED,
+    RETRYABLE,
+    REJECTED
+  }
+
+  /** Injectable command seam used to prove partial commit permutations. */
+  @FunctionalInterface
+  interface ControlCommandSender {
+    byte[] send(String serverId, String command, ControlEnvelope envelope,
+        @Nullable PrepareTarget target, byte[] payload) throws IOException;
   }
 }

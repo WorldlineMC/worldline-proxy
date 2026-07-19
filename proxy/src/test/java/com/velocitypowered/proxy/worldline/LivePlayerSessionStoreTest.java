@@ -22,6 +22,7 @@ import static com.velocitypowered.proxy.worldline.LivePlayerSessionStore.Status.
 import static com.velocitypowered.proxy.worldline.LivePlayerSessionStore.Status.REJECTED_MISMATCH;
 import static com.velocitypowered.proxy.worldline.LivePlayerSessionStore.Status.REJECTED_STALE_EPOCH;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -102,6 +103,97 @@ public class LivePlayerSessionStoreTest {
         "server-a", "server-b");
     assertEquals(ALREADY_APPLIED, duplicate.status());
     assertEquals(1, duplicate.after().orElseThrow().routeGeneration());
+  }
+
+  @Test
+  void forwardsOnlyTheCurrentAuthoritativeBackendBinding() {
+    LivePlayerSessionStore store = stagedStore();
+    BackendSessionBinding source = binding("server-a", 0, 0, TRANSFER);
+    BackendSessionBinding destination = binding("server-b", 1, 1, TRANSFER);
+
+    assertFalse(store.mayForwardGameplay(source), "source is frozen after snapshot staging");
+    assertFalse(store.mayForwardGameplay(destination), "destination is fenced before commit");
+
+    store.commit(PLAYER, 0, TRANSFER, "server-a", "server-b");
+    assertFalse(store.mayForwardGameplay(source), "source must be fenced at local commit");
+    assertFalse(store.mayForwardGameplay(destination), "destination stays fenced until active");
+
+    store.markActiveDestination(PLAYER, 1, TRANSFER);
+    assertFalse(store.mayForwardGameplay(source));
+    assertTrue(store.mayForwardGameplay(destination));
+  }
+
+  @Test
+  void rejectsEveryChangedBindingFence() {
+    LivePlayerSessionStore store = stagedStore();
+    store.commit(PLAYER, 0, TRANSFER, "server-a", "server-b");
+    store.markActiveDestination(PLAYER, 1, TRANSFER);
+
+    assertFalse(store.mayForwardGameplay(new BackendSessionBinding(
+        UUID.randomUUID(), CLIENT, "server-b", 1, 1, TRANSFER)));
+    assertFalse(store.mayForwardGameplay(new BackendSessionBinding(
+        PLAYER, UUID.randomUUID(), "server-b", 1, 1, TRANSFER)));
+    assertFalse(store.mayForwardGameplay(binding("server-a", 1, 1, TRANSFER)));
+    assertFalse(store.mayForwardGameplay(binding("server-b", 0, 1, TRANSFER)));
+    assertFalse(store.mayForwardGameplay(binding("server-b", 1, 0, TRANSFER)));
+    assertFalse(store.mayForwardGameplay(binding("server-b", 1, 1, UUID.randomUUID())));
+  }
+
+  @Test
+  void rejectsStaleSameServerBindingAfterReturningToThatServer() {
+    LivePlayerSessionStore store = stagedStore();
+    BackendSessionBinding firstServerABinding = binding("server-a", 0, 0, TRANSFER);
+    store.commit(PLAYER, 0, TRANSFER, "server-a", "server-b");
+    store.markActiveDestination(PLAYER, 1, TRANSFER);
+
+    assertFalse(store.mayForwardGameplay(firstServerABinding));
+    assertFalse(store.mayForwardGameplay(binding("server-a", 2, 2, UUID.randomUUID())),
+        "server name alone never grants authority");
+  }
+
+  @Test
+  void permitsAnOrdinaryActiveSourceBinding() {
+    LivePlayerSessionStore store = new LivePlayerSessionStore();
+    store.putActive(PLAYER, CLIENT, "server-a");
+
+    assertTrue(store.mayForwardGameplay(binding("server-a", 0, 0, null)));
+    assertTrue(store.mayForwardGameplay(binding("server-a", 0, 0, TRANSFER)),
+        "a retired destination connection keeps its immutable transfer-scoped binding");
+    assertTrue(store.maySendClientTransition(binding("server-a", 0, 0, TRANSFER)));
+
+    store.beginTransfer(PLAYER, 0, "server-a", TRANSFER);
+    assertFalse(store.maySendClientTransition(binding("server-a", 0, 0, TRANSFER)),
+        "client transition packets are forbidden for the duration of a splice");
+  }
+
+  @Test
+  void transferScopedBindingCanBecomeTheNextSteadySource() {
+    BackendSessionBinding previousDestination = binding("server-b", 1, 1, TRANSFER);
+
+    assertTrue(previousDestination.matchesAuthority(PLAYER, CLIENT, "server-b", 1, 1));
+    assertFalse(previousDestination.matchesAuthority(PLAYER, CLIENT, "server-a", 1, 1));
+    assertFalse(previousDestination.matchesAuthority(PLAYER, CLIENT, "server-b", 2, 1));
+  }
+
+  @Test
+  void retirementReturnsCommittedDestinationToSteadyAuthority() {
+    LivePlayerSessionStore store = stagedStore();
+    store.commit(PLAYER, 0, TRANSFER, "server-a", "server-b");
+    store.markActiveDestination(PLAYER, 1, TRANSFER);
+    store.markSourceCleaned(PLAYER, 1, TRANSFER);
+
+    LivePlayerSessionStore.TransitionResult retired = store.retireTransfer(PLAYER, 1, TRANSFER,
+        "server-b");
+
+    assertEquals(APPLIED, retired.status());
+    LivePlayerSession steady = retired.after().orElseThrow();
+    assertEquals(HandoffPhase.ACTIVE_SOURCE, steady.handoffPhase());
+    assertEquals(null, steady.activeTransferId());
+    assertEquals(1, steady.playerSessionEpoch());
+    assertEquals(1, steady.routeGeneration());
+    assertTrue(store.mayForwardGameplay(binding("server-b", 1, 1, TRANSFER)));
+    assertEquals(ALREADY_APPLIED,
+        store.retireTransfer(PLAYER, 1, TRANSFER, "server-b").status());
   }
 
   @Test
@@ -273,5 +365,10 @@ public class LivePlayerSessionStoreTest {
     store.markSourceFrozen(PLAYER, 0, TRANSFER);
     store.markSnapshotStaged(PLAYER, 0, TRANSFER);
     return store;
+  }
+
+  private static BackendSessionBinding binding(final String serverId, final long epoch,
+      final long generation, final UUID transferId) {
+    return new BackendSessionBinding(PLAYER, CLIENT, serverId, epoch, generation, transferId);
   }
 }

@@ -95,6 +95,10 @@ public class TransitionSessionHandler implements MinecraftSessionHandler {
     final ConnectedPlayer player = serverConn.getPlayer();
     final VelocityServerConnection existingConnection = player.getConnectedServer();
 
+    if (serverConn.getWorldlineResumeContext().isPresent()) {
+      return handleWorldlineDestinationReady(packet, smc, player, existingConnection);
+    }
+
     if (existingConnection != null) {
       // Shut down the existing server connection.
       player.setConnectedServer(null);
@@ -188,6 +192,33 @@ public class TransitionSessionHandler implements MinecraftSessionHandler {
           return null;
         });
 
+    return true;
+  }
+
+  private boolean handleWorldlineDestinationReady(final JoinGamePacket packet,
+      final MinecraftConnection smc, final ConnectedPlayer player,
+      final VelocityServerConnection existingConnection) {
+    final var context = serverConn.getWorldlineResumeContext().orElseThrow();
+    if (existingConnection == null
+        || !existingConnection.getServerInfo().getName().equals(context.sourceServerId())
+        || packet.getEntityId() != context.priorEntityId()) {
+      serverConn.disconnect();
+      resultFuture.completeExceptionally(
+          new IllegalStateException("Mismatched Worldline destination readiness"));
+      return true;
+    }
+    packet.setOnlineMode(player.isOnlineMode());
+    serverConn.setEntityId(packet.getEntityId());
+    serverConn.completeJoin();
+    smc.setActiveSessionHandler(StateRegistry.PLAY,
+        new BackendPlaySessionHandler(server, serverConn));
+    // Keep destination gameplay unread until the proxy records ACTIVE_DESTINATION. This also
+    // closes the cross-socket race where gameplay could arrive before the control ACK callback.
+    smc.setAutoReading(false);
+    logger.info("Worldline M5 destination ready for {} transfer={} source={} destination={}",
+        player.getUsername(), context.transferId(), context.sourceServerId(),
+        context.destinationServerId());
+    resultFuture.complete(ConnectionRequestResults.successful(serverConn.getServer()));
     return true;
   }
 
