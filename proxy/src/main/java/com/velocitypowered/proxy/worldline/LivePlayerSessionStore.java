@@ -82,11 +82,15 @@ public final class LivePlayerSessionStore {
       return false;
     }
     return switch (current.handoffPhase()) {
-      case ACTIVE_SOURCE, PREPARING_DESTINATION, DESTINATION_READY -> true;
+      // The source stays authoritative until commit: its output (world updates, keepalive
+      // challenges) must keep flowing while frozen or the client's keepalive responses arrive
+      // out of order and the source kicks the player mid-handoff.
+      case ACTIVE_SOURCE, PREPARING_DESTINATION, DESTINATION_READY, SOURCE_FROZEN,
+          SNAPSHOT_STAGED -> true;
       case ACTIVE_DESTINATION, SOURCE_CLEANED ->
           current.activeTransferId() != null
               && current.activeTransferId().equals(binding.transferId());
-      case SOURCE_FROZEN, SNAPSHOT_STAGED, COMMITTED -> false;
+      case COMMITTED -> false;
     };
   }
 

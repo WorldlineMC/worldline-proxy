@@ -40,6 +40,7 @@ import com.velocitypowered.proxy.connection.backend.VelocityServerConnection;
 import com.velocitypowered.proxy.connection.forge.legacy.LegacyForgeConstants;
 import com.velocitypowered.proxy.connection.player.resourcepack.ResourcePackResponseBundle;
 import com.velocitypowered.proxy.protocol.MinecraftPacket;
+import com.velocitypowered.proxy.protocol.ProtocolUtils;
 import com.velocitypowered.proxy.protocol.StateRegistry;
 import com.velocitypowered.proxy.protocol.netty.MinecraftDecoder;
 import com.velocitypowered.proxy.protocol.packet.BossBarPacket;
@@ -49,6 +50,7 @@ import com.velocitypowered.proxy.protocol.packet.KeepAlivePacket;
 import com.velocitypowered.proxy.protocol.packet.PluginMessagePacket;
 import com.velocitypowered.proxy.protocol.packet.ResourcePackResponsePacket;
 import com.velocitypowered.proxy.protocol.packet.RespawnPacket;
+import com.velocitypowered.proxy.protocol.packet.ServerboundClientTickEndPacket;
 import com.velocitypowered.proxy.protocol.packet.ServerboundCookieResponsePacket;
 import com.velocitypowered.proxy.protocol.packet.ServerboundMovePlayerPacket;
 import com.velocitypowered.proxy.protocol.packet.TabCompleteRequestPacket;
@@ -86,6 +88,7 @@ import com.velocitypowered.proxy.worldline.HandoffReplayGate;
 import com.velocitypowered.proxy.worldline.LivePlayerSession;
 import com.velocitypowered.proxy.worldline.LivePlayerSessionStore;
 import com.velocitypowered.proxy.worldline.PrepareTarget;
+import com.velocitypowered.proxy.worldline.ServerboundHandoffTraffic;
 import com.velocitypowered.proxy.worldline.ServerboundMovementRouter;
 import com.velocitypowered.proxy.worldline.WorldlineResumeContext;
 import io.netty.buffer.ByteBuf;
@@ -268,7 +271,7 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
   @Override
   public boolean handle(ClientSettingsPacket packet) {
     player.setClientSettings(packet);
-    if (abortFrozenGameplayInput()) {
+    if (abortFrozenGameplayInput(packet)) {
       return true;
     }
     VelocityServerConnection serverConnection = player.getConnectedServer();
@@ -282,7 +285,7 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
 
   @Override
   public boolean handle(SessionPlayerCommandPacket packet) {
-    if (abortFrozenGameplayInput()) {
+    if (abortFrozenGameplayInput(packet)) {
       return true;
     }
     if (player.getCurrentServer().isEmpty()) {
@@ -302,7 +305,7 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
 
   @Override
   public boolean handle(SessionPlayerChatPacket packet) {
-    if (abortFrozenGameplayInput()) {
+    if (abortFrozenGameplayInput(packet)) {
       return true;
     }
     if (player.getCurrentServer().isEmpty()) {
@@ -322,7 +325,7 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
 
   @Override
   public boolean handle(KeyedPlayerCommandPacket packet) {
-    if (abortFrozenGameplayInput()) {
+    if (abortFrozenGameplayInput(packet)) {
       return true;
     }
     if (player.getCurrentServer().isEmpty()) {
@@ -342,7 +345,7 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
 
   @Override
   public boolean handle(KeyedPlayerChatPacket packet) {
-    if (abortFrozenGameplayInput()) {
+    if (abortFrozenGameplayInput(packet)) {
       return true;
     }
     if (player.getCurrentServer().isEmpty()) {
@@ -362,7 +365,7 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
 
   @Override
   public boolean handle(LegacyChatPacket packet) {
-    if (abortFrozenGameplayInput()) {
+    if (abortFrozenGameplayInput(packet)) {
       return true;
     }
     if (player.getCurrentServer().isEmpty()) {
@@ -395,7 +398,7 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
 
   @Override
   public boolean handle(PluginMessagePacket packet) {
-    if (abortFrozenGameplayInput()) {
+    if (abortFrozenGameplayInput(packet)) {
       return true;
     }
     // Handling edge case when packet with FML client handshake (state COMPLETE)
@@ -623,6 +626,27 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
       logger.info("Worldline discarded preparation for {} after leaving the boundary", player);
     }
     return false;
+  }
+
+  @Override
+  public boolean handle(ServerboundClientTickEndPacket packet) {
+    if (HandoffReplayGate.mustBuffer(worldlineCurrentPhase(), worldlineReplayBuffer != null)) {
+      // Tick pacing carries no replayable state; elide it during the post-commit fence so the
+      // client's per-tick cadence cannot race the replay drain. While the source is merely
+      // frozen it still owns the connection, so tick pacing forwards to it like any other
+      // connection bookkeeping.
+      return true;
+    }
+    VelocityServerConnection serverConnection = player.getConnectedServer();
+    if (serverConnection == null) {
+      return true;
+    }
+    MinecraftConnection smc = serverConnection.getConnection();
+    if (smc != null && !smc.isClosed() && serverConnection.getPhase().consideredComplete()
+        && smc.getState() == StateRegistry.PLAY) {
+      smc.write(packet);
+    }
+    return true;
   }
 
   @Override
@@ -1080,7 +1104,7 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
 
   @Override
   public void handleGeneric(MinecraftPacket packet) {
-    if (abortFrozenGameplayInput()) {
+    if (abortFrozenGameplayInput(packet)) {
       return;
     }
     VelocityServerConnection serverConnection = player.getConnectedServer();
@@ -1104,7 +1128,16 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
 
   @Override
   public void handleUnknown(ByteBuf buf) {
-    if (abortFrozenGameplayInput()) {
+    final int packetIdIndex = buf.readerIndex();
+    final int packetId = ProtocolUtils.readVarInt(buf);
+    buf.readerIndex(packetIdIndex);
+    if (ServerboundHandoffTraffic.isConnectionBookkeeping(player.getProtocolVersion(),
+        packetId)) {
+      if (HandoffReplayGate.mustBuffer(worldlineCurrentPhase(), worldlineReplayBuffer != null)) {
+        // Bookkeeping for the fenced-out source is dropped until the destination owns the route.
+        return;
+      }
+    } else if (abortFrozenGameplayInput(String.format("unknown packet id=0x%02X", packetId))) {
       return;
     }
     VelocityServerConnection serverConnection = player.getConnectedServer();
@@ -1136,7 +1169,11 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
         .orElse(false);
   }
 
-  private boolean abortFrozenGameplayInput() {
+  private boolean abortFrozenGameplayInput(MinecraftPacket packet) {
+    return abortFrozenGameplayInput(packet.getClass().getSimpleName());
+  }
+
+  private boolean abortFrozenGameplayInput(String input) {
     if (HandoffReplayGate.rejectNonReplayable(worldlineCurrentPhase(),
         worldlineEnvelope != null)) {
       if (worldlineEnvelope != null) {
@@ -1148,8 +1185,8 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
       return false;
     }
     abortWorldlineHandoff(true);
-    logger.warn("Worldline aborted frozen transfer for {} on non-replayable gameplay input",
-        player);
+    logger.warn("Worldline aborted frozen transfer for {} on non-replayable gameplay input: {}",
+        player, input);
     return true;
   }
 

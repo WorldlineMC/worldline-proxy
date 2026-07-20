@@ -86,6 +86,7 @@ import com.velocitypowered.proxy.protocol.packet.RespawnPacket;
 import com.velocitypowered.proxy.protocol.packet.ServerDataPacket;
 import com.velocitypowered.proxy.protocol.packet.ServerLoginPacket;
 import com.velocitypowered.proxy.protocol.packet.ServerLoginSuccessPacket;
+import com.velocitypowered.proxy.protocol.packet.ServerboundClientTickEndPacket;
 import com.velocitypowered.proxy.protocol.packet.ServerboundCookieResponsePacket;
 import com.velocitypowered.proxy.protocol.packet.ServerboundCustomClickActionPacket;
 import com.velocitypowered.proxy.protocol.packet.ServerboundMovePlayerPacket;
@@ -417,6 +418,9 @@ public enum StateRegistry {
           map(0x0E, MINECRAFT_1_21_2, false),
           map(0x0F, MINECRAFT_1_21_6, false),
           map(0x10, MINECRAFT_26_1, false));
+      serverbound.register(
+          ServerboundClientTickEndPacket.class, () -> ServerboundClientTickEndPacket.INSTANCE,
+          map(0x0D, MINECRAFT_26_1, false));
       serverbound.register(
           ServerboundMovePlayerPacket.Position.class,
           ServerboundMovePlayerPacket.Position::new,

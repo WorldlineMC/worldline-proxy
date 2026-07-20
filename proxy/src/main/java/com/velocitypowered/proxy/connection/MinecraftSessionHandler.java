@@ -51,6 +51,7 @@ import com.velocitypowered.proxy.protocol.packet.RespawnPacket;
 import com.velocitypowered.proxy.protocol.packet.ServerDataPacket;
 import com.velocitypowered.proxy.protocol.packet.ServerLoginPacket;
 import com.velocitypowered.proxy.protocol.packet.ServerLoginSuccessPacket;
+import com.velocitypowered.proxy.protocol.packet.ServerboundClientTickEndPacket;
 import com.velocitypowered.proxy.protocol.packet.ServerboundCookieResponsePacket;
 import com.velocitypowered.proxy.protocol.packet.ServerboundCustomClickActionPacket;
 import com.velocitypowered.proxy.protocol.packet.ServerboundMovePlayerPacket;
@@ -367,6 +368,10 @@ public interface MinecraftSessionHandler {
   }
 
   default boolean handle(ServerboundMovePlayerPacket packet) {
+    return false;
+  }
+
+  default boolean handle(ServerboundClientTickEndPacket packet) {
     return false;
   }
 

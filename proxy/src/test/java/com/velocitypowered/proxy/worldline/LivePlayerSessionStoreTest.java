@@ -111,7 +111,8 @@ public class LivePlayerSessionStoreTest {
     BackendSessionBinding source = binding("server-a", 0, 0, TRANSFER);
     BackendSessionBinding destination = binding("server-b", 1, 1, TRANSFER);
 
-    assertFalse(store.mayForwardGameplay(source), "source is frozen after snapshot staging");
+    assertTrue(store.mayForwardGameplay(source),
+        "source output forwards until commit even while frozen");
     assertFalse(store.mayForwardGameplay(destination), "destination is fenced before commit");
 
     store.commit(PLAYER, 0, TRANSFER, "server-a", "server-b");
