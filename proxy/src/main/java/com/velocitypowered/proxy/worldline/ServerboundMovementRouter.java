@@ -29,6 +29,8 @@ import java.util.function.LongSupplier;
  */
 public final class ServerboundMovementRouter {
 
+  static final long DEFAULT_PREPARE_TIMEOUT_NANOS = TimeUnit.SECONDS.toNanos(4);
+
   private final BoundaryCrossingDetector detector;
   // ponytail: fixed slice cap; tune from measured M8 buffer budgets.
   private final int maxBufferedPackets;
@@ -46,7 +48,7 @@ public final class ServerboundMovementRouter {
    * Creates a movement router using shared partition-boundary logic.
    */
   public ServerboundMovementRouter(final BoundaryCrossingDetector detector) {
-    this(detector, 64, TimeUnit.SECONDS.toNanos(2), System::nanoTime);
+    this(detector, 64, DEFAULT_PREPARE_TIMEOUT_NANOS, System::nanoTime);
   }
 
   /**
@@ -54,7 +56,7 @@ public final class ServerboundMovementRouter {
    */
   public ServerboundMovementRouter(final BoundaryCrossingDetector detector,
       final int maxBufferedPackets) {
-    this(detector, maxBufferedPackets, TimeUnit.SECONDS.toNanos(2), System::nanoTime);
+    this(detector, maxBufferedPackets, DEFAULT_PREPARE_TIMEOUT_NANOS, System::nanoTime);
   }
 
   /**

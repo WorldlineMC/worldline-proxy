@@ -47,6 +47,11 @@ public class WorldlineControlTransportTest {
   Path tempDir;
 
   @Test
+  void allowsPaperPreparationToFinishBeforeTheSocketTimesOut() {
+    assertEquals(3_000, WorldlineControlTransport.TIMEOUT_MILLIS);
+  }
+
+  @Test
   void framesAndCorrelatesCompleteEnvelope() throws Exception {
     try (FakeControlServer server = new FakeControlServer(1, Response.VALID)) {
       transport(server.port()).send("server-b", "PREPARE", envelope(), TARGET);

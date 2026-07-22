@@ -35,6 +35,7 @@ import io.netty.buffer.Unpooled;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -46,6 +47,14 @@ public class ServerboundMovementRouterTest {
 
   @TempDir
   Path tempDir;
+
+  @Test
+  void movementPreparationOutlivesTheControlSocketTimeout() {
+    assertEquals(TimeUnit.SECONDS.toNanos(4),
+        ServerboundMovementRouter.DEFAULT_PREPARE_TIMEOUT_NANOS);
+    assertTrue(ServerboundMovementRouter.DEFAULT_PREPARE_TIMEOUT_NANOS
+        > TimeUnit.MILLISECONDS.toNanos(WorldlineControlTransport.TIMEOUT_MILLIS));
+  }
 
   @Test
   void withholdsFirstCrossingPacket() throws Exception {

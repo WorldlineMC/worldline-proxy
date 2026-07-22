@@ -34,7 +34,7 @@ public final class WorldlineControlTransport {
 
   static final int MAGIC = 0x574c4d32;
   static final int MAX_PAYLOAD_BYTES = 1_048_576;
-  private static final int TIMEOUT_MILLIS = 2_000;
+  static final int TIMEOUT_MILLIS = 3_000;
 
   private final StaticPartitionMap partitions;
 
