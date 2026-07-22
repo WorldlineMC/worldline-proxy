@@ -21,7 +21,6 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.UUID;
-import java.util.concurrent.TimeUnit;
 import java.util.function.LongSupplier;
 
 /** Bounded, transfer-fenced, one-shot replay storage for serverbound input. */
@@ -31,30 +30,57 @@ public final class HandoffReplayBuffer<T> {
   private final long playerSessionEpoch;
   private final long routeGeneration;
   private final int maxEntries;
-  private final long deadlineNanos;
   private final LongSupplier ticker;
   private final List<Entry<T>> entries = new ArrayList<>();
+  private volatile long deadlineNanos;
+  private volatile boolean deadlineArmed;
   private boolean consumed;
 
   /** Creates the production replay buffer. */
   public HandoffReplayBuffer(final UUID transferId, final long playerSessionEpoch,
       final long routeGeneration, final int maxEntries) {
-    this(transferId, playerSessionEpoch, routeGeneration, maxEntries,
-        TimeUnit.SECONDS.toNanos(5), System::nanoTime);
+    this(transferId, playerSessionEpoch, routeGeneration, maxEntries, System::nanoTime);
+  }
+
+  HandoffReplayBuffer(final UUID transferId, final long playerSessionEpoch,
+      final long routeGeneration, final int maxEntries, final LongSupplier ticker) {
+    this(transferId, playerSessionEpoch, routeGeneration, maxEntries, ticker, false, 0);
   }
 
   HandoffReplayBuffer(final UUID transferId, final long playerSessionEpoch,
       final long routeGeneration, final int maxEntries, final long maxAgeNanos,
       final LongSupplier ticker) {
+    this(transferId, playerSessionEpoch, routeGeneration, maxEntries, ticker, true, maxAgeNanos);
+  }
+
+  private HandoffReplayBuffer(final UUID transferId, final long playerSessionEpoch,
+      final long routeGeneration, final int maxEntries, final LongSupplier ticker,
+      final boolean armDeadline, final long maxAgeNanos) {
     this.transferId = Objects.requireNonNull(transferId, "transferId");
-    if (playerSessionEpoch < 0 || routeGeneration < 0 || maxEntries < 1 || maxAgeNanos < 1) {
+    this.ticker = Objects.requireNonNull(ticker, "ticker");
+    if (playerSessionEpoch < 0 || routeGeneration < 0 || maxEntries < 1
+        || (armDeadline && maxAgeNanos < 1)) {
       throw new IllegalArgumentException("invalid replay fence or bound");
     }
     this.playerSessionEpoch = playerSessionEpoch;
     this.routeGeneration = routeGeneration;
     this.maxEntries = maxEntries;
-    this.ticker = ticker;
-    this.deadlineNanos = ticker.getAsLong() + maxAgeNanos;
+    if (armDeadline) {
+      this.deadlineNanos = ticker.getAsLong() + maxAgeNanos;
+      this.deadlineArmed = true;
+    }
+  }
+
+  /** Arms the one post-commit deadline shared with the transfer coordinator. */
+  public synchronized void armDeadline(final long absoluteDeadlineNanos) {
+    if (deadlineArmed) {
+      throw new IllegalStateException("replay deadline was already armed");
+    }
+    if (absoluteDeadlineNanos < 1) {
+      throw new IllegalArgumentException("replay deadline must be positive");
+    }
+    deadlineNanos = absoluteDeadlineNanos;
+    deadlineArmed = true;
   }
 
   /** Appends one ordered entry while the buffer remains live and within bounds. */
@@ -63,7 +89,7 @@ public final class HandoffReplayBuffer<T> {
     if (consumed) {
       return AppendResult.CONSUMED;
     }
-    if (ticker.getAsLong() > deadlineNanos) {
+    if (expired()) {
       return AppendResult.EXPIRED;
     }
     if (entries.size() >= maxEntries) {
@@ -80,7 +106,7 @@ public final class HandoffReplayBuffer<T> {
     if (consumed) {
       throw new IllegalStateException("replay buffer was already consumed");
     }
-    if (ticker.getAsLong() > deadlineNanos) {
+    if (expired()) {
       consumed = true;
       entries.clear();
       throw new IllegalStateException("replay buffer expired before drain");
@@ -107,6 +133,10 @@ public final class HandoffReplayBuffer<T> {
 
   public boolean consumed() {
     return consumed;
+  }
+
+  private boolean expired() {
+    return deadlineArmed && ticker.getAsLong() > deadlineNanos;
   }
 
   private void validateFence(final UUID expectedTransferId, final long expectedEpoch,

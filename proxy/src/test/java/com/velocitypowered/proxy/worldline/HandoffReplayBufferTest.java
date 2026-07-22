@@ -95,6 +95,7 @@ public class HandoffReplayBufferTest {
 
   @Test
   void replayGateStaysClosedAcrossActivationUntilTheEventLoopDrain() {
+    assertTrue(HandoffReplayGate.mustBuffer(HandoffPhase.SNAPSHOT_STAGED, true));
     assertTrue(HandoffReplayGate.mustBuffer(HandoffPhase.COMMITTED, true));
     assertTrue(HandoffReplayGate.mustBuffer(HandoffPhase.ACTIVE_DESTINATION, true));
     assertFalse(HandoffReplayGate.mustBuffer(HandoffPhase.ACTIVE_DESTINATION, false));
@@ -103,5 +104,22 @@ public class HandoffReplayBufferTest {
     assertTrue(HandoffReplayGate.rejectNonReplayable(HandoffPhase.ACTIVE_DESTINATION, true));
     assertTrue(HandoffReplayGate.rejectNonReplayable(HandoffPhase.SOURCE_CLEANED, true));
     assertFalse(HandoffReplayGate.rejectNonReplayable(HandoffPhase.ACTIVE_SOURCE, false));
+  }
+
+  @Test
+  void precommitDelayDoesNotConsumeThePostCommitReplayDeadline() {
+    AtomicLong now = new AtomicLong(100);
+    HandoffReplayBuffer<String> buffer = new HandoffReplayBuffer<>(
+        TRANSFER, 4, 9, 4, now::get);
+
+    now.set(10_000);
+    assertEquals(HandoffReplayBuffer.AppendResult.APPENDED, buffer.append("crossing"));
+
+    buffer.armDeadline(10_010);
+    now.set(10_010);
+    assertEquals(HandoffReplayBuffer.AppendResult.APPENDED, buffer.append("at-deadline"));
+    now.set(10_011);
+    assertEquals(HandoffReplayBuffer.AppendResult.EXPIRED, buffer.append("too-late"));
+    assertThrows(IllegalStateException.class, () -> buffer.armDeadline(20_000));
   }
 }

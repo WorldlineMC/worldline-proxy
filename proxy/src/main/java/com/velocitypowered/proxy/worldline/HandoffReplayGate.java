@@ -28,8 +28,7 @@ public final class HandoffReplayGate {
   /** Keeps the gate closed until the event-loop replay drain has completed. */
   public static boolean mustBuffer(final @Nullable HandoffPhase phase,
       final boolean replayPending) {
-    return replayPending
-        && (phase == HandoffPhase.COMMITTED || phase == HandoffPhase.ACTIVE_DESTINATION);
+    return replayPending;
   }
 
   /** Rejects unsupported input for the entire committed transfer, including cleanup. */

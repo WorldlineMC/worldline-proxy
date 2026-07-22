@@ -797,9 +797,14 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
     Thread.startVirtualThread(() -> {
       try {
         commit.complete(server.getWorldlineControlPlane().commit(envelope,
-            () -> worldlinePostCommitDeadline = player.getConnection().eventLoop().schedule(
-                () -> failWorldlinePostCommit(envelope, "post-commit deadline expired"),
-                WORLDLINE_POST_COMMIT_TIMEOUT_SECONDS, TimeUnit.SECONDS)));
+            () -> {
+              long deadlineNanos = System.nanoTime()
+                  + TimeUnit.SECONDS.toNanos(WORLDLINE_POST_COMMIT_TIMEOUT_SECONDS);
+              replay.armDeadline(deadlineNanos);
+              worldlinePostCommitDeadline = player.getConnection().eventLoop().schedule(
+                  () -> failWorldlinePostCommit(envelope, "post-commit deadline expired"),
+                  Math.max(0, deadlineNanos - System.nanoTime()), TimeUnit.NANOSECONDS);
+            }));
       } catch (Throwable throwable) {
         commit.completeExceptionally(throwable);
       }
