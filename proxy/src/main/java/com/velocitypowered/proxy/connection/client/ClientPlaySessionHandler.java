@@ -932,15 +932,8 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
         new CompletableFuture<>();
     worldlinePostCommitFuture = cleanup;
     Thread.startVirtualThread(() -> {
-      LivePlayerSessionStore.TransitionResult last = null;
       try {
-        for (int attempt = 0; attempt < 3; attempt++) {
-          last = server.getWorldlineControlPlane().cleanSource(envelope);
-          if (successful(last)) {
-            break;
-          }
-        }
-        cleanup.complete(last);
+        cleanup.complete(server.getWorldlineControlPlane().cleanSource(envelope));
       } catch (Throwable throwable) {
         cleanup.completeExceptionally(throwable);
       }
@@ -1006,38 +999,41 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
     logger.error("Worldline terminal post-commit failure for {} transfer={}: {}", player,
         envelope.transferId(), reason);
     Thread.startVirtualThread(() -> {
+      boolean destinationRetired = false;
       try {
-        server.getWorldlineControlPlane().retireDestination(envelope);
+        LivePlayerSessionStore.TransitionResult retired =
+            server.getWorldlineControlPlane().retireDestination(envelope);
+        destinationRetired = successful(retired);
+        if (!destinationRetired) {
+          logger.error("Worldline retained pending destination retirement for {} transfer={} "
+                  + "status={}", player, envelope.transferId(), retired.status());
+        }
       } catch (RuntimeException retirementFailure) {
         logger.error("Worldline destination retirement failed for {} transfer={}", player,
             envelope.transferId(), retirementFailure);
       }
       boolean sourceCleaned = false;
-      for (int attempt = 0; attempt < 3; attempt++) {
-        try {
-          LivePlayerSessionStore.TransitionResult cleaned =
-              server.getWorldlineControlPlane().cleanSource(envelope);
-          if (successful(cleaned)) {
-            sourceCleaned = true;
-            break;
-          }
-        } catch (RuntimeException cleanupFailure) {
-          logger.warn("Worldline source cleanup attempt {} failed for {} transfer={}",
-              attempt + 1, player, envelope.transferId(), cleanupFailure);
+      try {
+        LivePlayerSessionStore.TransitionResult cleaned =
+            server.getWorldlineControlPlane().cleanSource(envelope);
+        sourceCleaned = successful(cleaned);
+        if (!sourceCleaned) {
+          logger.error("Worldline retained pending source cleanup for {} transfer={} status={}",
+              player, envelope.transferId(), cleaned.status());
         }
+      } catch (RuntimeException cleanupFailure) {
+        logger.error("Worldline source cleanup failed for {} transfer={}", player,
+            envelope.transferId(), cleanupFailure);
       }
       final boolean cleanupCompleted = sourceCleaned;
-      if (!cleanupCompleted) {
-        logger.error("Worldline retained pending source cleanup for {} transfer={}", player,
-            envelope.transferId());
-      }
+      final boolean terminalCommandsCompleted = destinationRetired && sourceCleaned;
       player.getConnection().eventLoop().execute(() -> {
         if (cleanupCompleted && worldlineSourceConnection != null) {
           player.disconnectWorldlineSourceAfterCleanup(worldlineSourceConnection);
         }
         player.disconnect(Component.translatable("velocity.error.player-connection-error",
             NamedTextColor.RED));
-        if (cleanupCompleted) {
+        if (terminalCommandsCompleted) {
           player.teardown();
         }
       });

@@ -37,6 +37,7 @@ public final class HandoffControlPlane {
   private static final Logger logger = LogManager.getLogger(HandoffControlPlane.class);
 
   private final LivePlayerSessionStore sessions;
+  private final WorldlineControlRetry terminalRetry;
   private @Nullable StaticPartitionMap partitions;
   private @Nullable ControlCommandSender sender;
 
@@ -44,13 +45,19 @@ public final class HandoffControlPlane {
    * Creates a control plane over the supplied live session store.
    */
   public HandoffControlPlane(final LivePlayerSessionStore sessions) {
-    this.sessions = sessions;
+    this(sessions, null, new WorldlineControlRetry());
   }
 
   HandoffControlPlane(final LivePlayerSessionStore sessions,
       final ControlCommandSender sender) {
+    this(sessions, sender, new WorldlineControlRetry());
+  }
+
+  HandoffControlPlane(final LivePlayerSessionStore sessions,
+      final @Nullable ControlCommandSender sender, final WorldlineControlRetry terminalRetry) {
     this.sessions = sessions;
     this.sender = sender;
+    this.terminalRetry = terminalRetry;
   }
 
   /**
@@ -245,14 +252,16 @@ public final class HandoffControlPlane {
   public LivePlayerSessionStore.TransitionResult cleanSource(final ControlEnvelope envelope) {
     validateProtocol(envelope);
     ControlEnvelope committed = committedEnvelope(envelope);
-    LivePlayerSessionStore.TransitionResult rejection = beforeServerCommand(
-        envelope.sourceServerId(), "CLEAN_SOURCE", committed);
-    if (rejection != null) {
-      return rejection;
-    }
-    return transition(HandoffPhase.SOURCE_CLEANED, envelope,
-        () -> sessions.markSourceCleaned(envelope.playerUuid(), envelope.playerSessionEpoch() + 1,
-            envelope.transferId()));
+    return terminalRetry.execute(() -> {
+      LivePlayerSessionStore.TransitionResult rejection = beforeServerCommand(
+          envelope.sourceServerId(), "CLEAN_SOURCE", committed);
+      if (rejection != null) {
+        return rejection;
+      }
+      return transition(HandoffPhase.SOURCE_CLEANED, envelope,
+          () -> sessions.markSourceCleaned(envelope.playerUuid(),
+              envelope.playerSessionEpoch() + 1, envelope.transferId()));
+    }).result();
   }
 
   /** Releases destination resources after a terminal post-commit failure. */
@@ -260,14 +269,16 @@ public final class HandoffControlPlane {
       final ControlEnvelope envelope) {
     validateProtocol(envelope);
     ControlEnvelope committed = committedEnvelope(envelope);
-    LivePlayerSessionStore.TransitionResult rejection = beforeServerCommand(
-        envelope.destinationServerId(), "RETIRE_DESTINATION", committed);
-    if (rejection != null) {
-      return rejection;
-    }
-    return sessions.get(envelope.playerUuid())
-        .map(LivePlayerSessionStore.TransitionResult::alreadyApplied)
-        .orElseGet(LivePlayerSessionStore.TransitionResult::missing);
+    return terminalRetry.execute(() -> {
+      LivePlayerSessionStore.TransitionResult rejection = beforeServerCommand(
+          envelope.destinationServerId(), "RETIRE_DESTINATION", committed);
+      if (rejection != null) {
+        return rejection;
+      }
+      return sessions.get(envelope.playerUuid())
+          .map(LivePlayerSessionStore.TransitionResult::alreadyApplied)
+          .orElseGet(LivePlayerSessionStore.TransitionResult::missing);
+    }).result();
   }
 
   private LivePlayerSessionStore.TransitionResult transition(final HandoffPhase phase,

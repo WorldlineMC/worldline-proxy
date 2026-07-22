@@ -145,6 +145,26 @@ public class HandoffControlPlaneTest {
   }
 
   @Test
+  void terminalCommandsRetryUnavailableStatusesAndInspectTheirResults() {
+    LivePlayerSessionStore cleanupSessions = activeDestinationSessions();
+    RecordingSender cleanupSender = new RecordingSender(Outcome.IO_FAILURE, Outcome.ACK);
+    HandoffControlPlane cleanupControl = new HandoffControlPlane(cleanupSessions, cleanupSender);
+
+    assertEquals(APPLIED, cleanupControl.cleanSource(envelope()).status());
+    assertEquals(List.of("server-a:CLEAN_SOURCE", "server-a:CLEAN_SOURCE"),
+        cleanupSender.commands);
+
+    LivePlayerSessionStore retirementSessions = activeDestinationSessions();
+    RecordingSender retirementSender = new RecordingSender(Outcome.IO_FAILURE, Outcome.ACK);
+    HandoffControlPlane retirementControl =
+        new HandoffControlPlane(retirementSessions, retirementSender);
+
+    assertEquals(ALREADY_APPLIED, retirementControl.retireDestination(envelope()).status());
+    assertEquals(List.of("server-b:RETIRE_DESTINATION", "server-b:RETIRE_DESTINATION"),
+        retirementSender.commands);
+  }
+
+  @Test
   void commitUsesCommittedFencesAndBothCommands() {
     LivePlayerSessionStore sessions = stagedSessions();
     RecordingSender sender = new RecordingSender();
@@ -378,6 +398,13 @@ public class HandoffControlPlaneTest {
     sessions.markDestinationReady(PLAYER, 0, TRANSFER);
     sessions.markSourceFrozen(PLAYER, 0, TRANSFER);
     sessions.markSnapshotStaged(PLAYER, 0, TRANSFER);
+    return sessions;
+  }
+
+  private static LivePlayerSessionStore activeDestinationSessions() {
+    LivePlayerSessionStore sessions = stagedSessions();
+    sessions.commit(PLAYER, 0, TRANSFER, "server-a", "server-b");
+    sessions.markActiveDestination(PLAYER, 1, TRANSFER);
     return sessions;
   }
 
