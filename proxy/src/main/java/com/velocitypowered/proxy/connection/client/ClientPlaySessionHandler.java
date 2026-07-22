@@ -80,6 +80,7 @@ import com.velocitypowered.proxy.util.CharacterUtil;
 import com.velocitypowered.proxy.util.except.QuietRuntimeException;
 import com.velocitypowered.proxy.worldline.BoundaryCrossingDetector;
 import com.velocitypowered.proxy.worldline.BackendSessionBinding;
+import com.velocitypowered.proxy.worldline.AsyncHandoffFence;
 import com.velocitypowered.proxy.worldline.ControlEnvelope;
 import com.velocitypowered.proxy.worldline.HandoffControlPlane;
 import com.velocitypowered.proxy.worldline.HandoffPhase;
@@ -469,17 +470,22 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
           } else {
             byte[] copy = ByteBufUtil.getBytes(packet.content());
             PluginMessageEvent event = new PluginMessageEvent(player, serverConn, id, copy);
+            AsyncHandoffFence callbackFence = captureWorldlineCallbackFence(serverConn);
             server.getEventManager().fire(event).thenAcceptAsync(pme -> {
               if (pme.getResult().isAllowed()) {
-                PluginMessagePacket message = new PluginMessagePacket(packet.getChannel(),
-                    Unpooled.wrappedBuffer(copy));
-                if (!player.getPhase().consideredComplete() || !serverConn.getPhase()
-                    .consideredComplete()) {
-                  // We're still processing the connection (see above), enqueue the packet for now.
-                  enqueueLoginPluginMessage(message.retain());
-                } else {
-                  backendConn.write(message);
-                }
+                runFencedWorldlineCallback(callbackFence, worldlineClientConnectionId,
+                    currentWorldlineSession(), serverId(serverConn),
+                    worldlineConnectionStillSelected(serverConn), () -> {
+                      PluginMessagePacket message = new PluginMessagePacket(packet.getChannel(),
+                          Unpooled.wrappedBuffer(copy));
+                      if (!player.getPhase().consideredComplete() || !serverConn.getPhase()
+                          .consideredComplete()) {
+                        // We're still processing the connection (see above), enqueue the packet.
+                        enqueueLoginPluginMessage(message.retain());
+                      } else {
+                        backendConn.write(message);
+                      }
+                    });
               }
             }, backendConn.eventLoop()).exceptionally((ex) -> {
               logger.error("Exception while handling plugin message packet for {}", player, ex);
@@ -495,6 +501,9 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
 
   @Override
   public boolean handle(ResourcePackResponsePacket packet) {
+    if (abortFrozenGameplayInput(packet)) {
+      return true;
+    }
     return player.resourcePackHandler().onResourcePackResponse(
         new ResourcePackResponseBundle(packet.getId(),
             packet.getHash(),
@@ -528,6 +537,10 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
 
   @Override
   public boolean handle(ChatAcknowledgementPacket packet) {
+    if (usesUnsignedWorldlineChat(worldlineMovementRouter != null,
+        System.getProperty("worldline.splice-target", ""))) {
+      return true;
+    }
     if (player.getCurrentServer().isEmpty()) {
       return true;
     }
@@ -537,19 +550,24 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
 
   @Override
   public boolean handle(ServerboundCookieResponsePacket packet) {
+    final VelocityServerConnection originalConnection = player.getConnectedServer();
+    final AsyncHandoffFence callbackFence = originalConnection == null
+        ? null : captureWorldlineCallbackFence(originalConnection);
     server.getEventManager()
         .fire(new CookieReceiveEvent(player, packet.getKey(), packet.getPayload()))
         .thenAcceptAsync(event -> {
           if (event.getResult().isAllowed()) {
-            final VelocityServerConnection serverConnection = player.getConnectedServer();
-            if (serverConnection != null) {
+            if (originalConnection != null && callbackFence != null) {
               final Key resultedKey = event.getResult().getKey() == null
                   ? event.getOriginalKey() : event.getResult().getKey();
               final byte[] resultedData = event.getResult().getData() == null
                   ? event.getOriginalData() : event.getResult().getData();
 
-              serverConnection.ensureConnected()
-                  .write(new ServerboundCookieResponsePacket(resultedKey, resultedData));
+              runFencedWorldlineCallback(callbackFence, worldlineClientConnectionId,
+                  currentWorldlineSession(), serverId(originalConnection),
+                  worldlineConnectionStillSelected(originalConnection),
+                  () -> originalConnection.ensureConnected()
+                      .write(new ServerboundCookieResponsePacket(resultedKey, resultedData)));
             }
           }
         }, player.getConnection().eventLoop());
@@ -559,7 +577,8 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
 
   @Override
   public boolean handle(ChatSessionUpdatePacket packet) {
-    if (!System.getProperty("worldline.splice-target", "").isEmpty()) {
+    if (usesUnsignedWorldlineChat(worldlineMovementRouter != null,
+        System.getProperty("worldline.splice-target", ""))) {
       // With the splice armed, no backend may ever install the client's chat session: a backend
       // holding the session broadcasts the player's chat signed, which advances the client's
       // last-seen acknowledgement window, and the next backend after a splice would then kick the
@@ -1179,20 +1198,64 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
   }
 
   private boolean abortFrozenGameplayInput(String input) {
-    if (HandoffReplayGate.rejectNonReplayable(worldlineCurrentPhase(),
-        worldlineEnvelope != null)) {
+    HandoffPhase phase = worldlineCurrentPhase();
+    boolean transferActive = worldlineEnvelope != null;
+    boolean sourceFrozen = worldlineSourceFrozen();
+    if (!blocksConnectionSensitiveInput(phase, transferActive, sourceFrozen)) {
+      return false;
+    }
+    if (HandoffReplayGate.rejectNonReplayable(phase, transferActive)) {
       if (worldlineEnvelope != null) {
         failWorldlinePostCommit(worldlineEnvelope, "non-replayable post-commit gameplay input");
       }
       return true;
     }
-    if (!worldlineSourceFrozen()) {
-      return false;
-    }
     abortWorldlineHandoff(true);
     logger.warn("Worldline aborted frozen transfer for {} on non-replayable gameplay input: {}",
         player, input);
     return true;
+  }
+
+  private AsyncHandoffFence captureWorldlineCallbackFence(
+      final VelocityServerConnection serverConnection) {
+    return AsyncHandoffFence.capture(worldlineClientConnectionId, currentWorldlineSession(),
+        serverId(serverConnection));
+  }
+
+  private @Nullable LivePlayerSession currentWorldlineSession() {
+    return server.getWorldlineLiveSessions().get(player.getUniqueId()).orElse(null);
+  }
+
+  private boolean worldlineConnectionStillSelected(
+      final VelocityServerConnection expectedConnection) {
+    return player.getConnectedServer() == expectedConnection
+        || player.getConnectionInFlight() == expectedConnection;
+  }
+
+  private static String serverId(final VelocityServerConnection serverConnection) {
+    return serverConnection.getServerInfo().getName();
+  }
+
+  static boolean runFencedWorldlineCallback(final AsyncHandoffFence fence,
+      final UUID currentClientConnectionId, final @Nullable LivePlayerSession currentSession,
+      final String currentBackendServerId, final boolean backendConnectionStillSelected,
+      final Runnable callback) {
+    if (!backendConnectionStillSelected
+        || !fence.matches(currentClientConnectionId, currentSession, currentBackendServerId)) {
+      return false;
+    }
+    callback.run();
+    return true;
+  }
+
+  static boolean usesUnsignedWorldlineChat(final boolean m5BoundaryEnabled,
+      final String legacySpliceTarget) {
+    return m5BoundaryEnabled || !legacySpliceTarget.isEmpty();
+  }
+
+  static boolean blocksConnectionSensitiveInput(final @Nullable HandoffPhase phase,
+      final boolean transferActive, final boolean sourceFrozen) {
+    return sourceFrozen || HandoffReplayGate.rejectNonReplayable(phase, transferActive);
   }
 
   private @Nullable HandoffPhase worldlineCurrentPhase() {
