@@ -95,6 +95,34 @@ public class HandoffControlPlaneTest {
   }
 
   @Test
+  void abortRetriesALostSourceAcknowledgementAndConverges() {
+    LivePlayerSessionStore sessions = stagedSessions();
+    RecordingSender sender = new RecordingSender(Outcome.IO_FAILURE, Outcome.ACK, Outcome.ACK);
+    HandoffControlPlane control = new HandoffControlPlane(sessions, sender);
+
+    assertEquals(APPLIED, control.abort(envelope()).status());
+    assertEquals(List.of("server-a:ABORT_SOURCE", "server-a:ABORT_SOURCE", "server-b:ABORT"),
+        sender.commands);
+    assertEquals(HandoffPhase.ACTIVE_SOURCE, sessions.get(PLAYER).orElseThrow().handoffPhase());
+  }
+
+  @Test
+  void abortExhaustionKeepsTheLiveTransferExplicitlyPending() {
+    LivePlayerSessionStore sessions = stagedSessions();
+    RecordingSender sender = new RecordingSender(
+        Outcome.IO_FAILURE, Outcome.IO_FAILURE, Outcome.IO_FAILURE);
+    HandoffControlPlane control = new HandoffControlPlane(sessions, sender);
+
+    assertEquals(CONTROL_UNAVAILABLE, control.abort(envelope()).status());
+    assertEquals(List.of(
+        "server-a:ABORT_SOURCE", "server-a:ABORT_SOURCE", "server-a:ABORT_SOURCE"),
+        sender.commands);
+    LivePlayerSession retained = sessions.get(PLAYER).orElseThrow();
+    assertEquals(TRANSFER, retained.activeTransferId());
+    assertEquals(HandoffPhase.SNAPSHOT_STAGED, retained.handoffPhase());
+  }
+
+  @Test
   void scriptedCommitRoundTrip() {
     LivePlayerSessionStore sessions = new LivePlayerSessionStore();
     sessions.putActive(PLAYER, CLIENT, "server-a");

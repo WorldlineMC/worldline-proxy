@@ -18,12 +18,29 @@
 package com.velocitypowered.proxy.connection.client;
 
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.timeout;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
+import com.velocitypowered.api.network.ProtocolVersion;
+import com.velocitypowered.proxy.VelocityServer;
+import com.velocitypowered.proxy.connection.MinecraftConnection;
 import com.velocitypowered.proxy.worldline.AsyncHandoffFence;
+import com.velocitypowered.proxy.worldline.ControlEnvelope;
+import com.velocitypowered.proxy.worldline.HandoffControlPlane;
 import com.velocitypowered.proxy.worldline.HandoffPhase;
 import com.velocitypowered.proxy.worldline.LivePlayerSession;
+import com.velocitypowered.proxy.worldline.LivePlayerSessionStore;
+import io.netty.channel.DefaultEventLoop;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.junit.jupiter.api.Test;
 
@@ -77,5 +94,95 @@ public class ClientPlaySessionHandlerWorldlineTest {
         HandoffPhase.COMMITTED, true, false));
     assertFalse(ClientPlaySessionHandler.blocksConnectionSensitiveInput(
         HandoffPhase.ACTIVE_SOURCE, false, false));
+  }
+
+  @Test
+  void abortStateIsRetainedUntilTheOrderedAbortConverges() throws Exception {
+    VelocityServer server = mock(VelocityServer.class);
+    ConnectedPlayer player = mock(ConnectedPlayer.class);
+    MinecraftConnection connection = mock(MinecraftConnection.class);
+    HandoffControlPlane control = mock(HandoffControlPlane.class);
+    DefaultEventLoop eventLoop = new DefaultEventLoop();
+    UUID transfer = UUID.randomUUID();
+    ControlEnvelope envelope = new ControlEnvelope(HandoffControlPlane.PROTOCOL_VERSION, transfer,
+        PLAYER, CLIENT, "server-a", "server-b", "west", "east", 0, 0, 0, 1, 0);
+    LivePlayerSession retained = new LivePlayerSession(PLAYER, CLIENT, "server-a", 0, 0,
+        transfer, HandoffPhase.SNAPSHOT_STAGED);
+    LivePlayerSession active = new LivePlayerSession(PLAYER, CLIENT, "server-a", 0, 0,
+        null, HandoffPhase.ACTIVE_SOURCE);
+    LivePlayerSessionStore.TransitionResult unavailable = new LivePlayerSessionStore.TransitionResult(
+        LivePlayerSessionStore.Status.CONTROL_UNAVAILABLE, Optional.of(retained),
+        Optional.of(retained), 0);
+    LivePlayerSessionStore.TransitionResult applied = new LivePlayerSessionStore.TransitionResult(
+        LivePlayerSessionStore.Status.APPLIED, Optional.of(retained), Optional.of(active), 0);
+    CompletableFuture<LivePlayerSessionStore.TransitionResult> prepare = new CompletableFuture<>();
+
+    when(player.getProtocolVersion()).thenReturn(ProtocolVersion.MINECRAFT_26_1);
+    when(player.getConnection()).thenReturn(connection);
+    when(connection.eventLoop()).thenReturn(eventLoop);
+    when(server.getWorldlineBoundaryDetector()).thenReturn(Optional.empty());
+    when(server.getWorldlineControlPlane()).thenReturn(control);
+    when(control.abort(envelope)).thenReturn(unavailable, applied);
+
+    try {
+      ClientPlaySessionHandler handler = new ClientPlaySessionHandler(server, player);
+      setField(handler, "worldlineTransferId", transfer);
+      setField(handler, "worldlineEnvelope", envelope);
+      setField(handler, "worldlinePrepareFuture", prepare);
+
+      invokeAbort(handler);
+      assertSame(envelope, getField(handler, "worldlineEnvelope"));
+      assertSame(transfer, getField(handler, "worldlineTransferId"));
+
+      prepare.complete(unavailable);
+      verify(control, timeout(1_000)).abort(envelope);
+      drain(eventLoop);
+      assertSame(envelope, getField(handler, "worldlineEnvelope"));
+      assertSame(transfer, getField(handler, "worldlineTransferId"));
+
+      invokeAbort(handler);
+      verify(control, timeout(1_000).times(2)).abort(envelope);
+      awaitCleared(handler, eventLoop);
+      assertNull(getField(handler, "worldlineEnvelope"));
+      assertNull(getField(handler, "worldlineTransferId"));
+    } finally {
+      eventLoop.shutdownGracefully().syncUninterruptibly();
+    }
+  }
+
+  private static void invokeAbort(final ClientPlaySessionHandler handler) throws Exception {
+    Method abort = ClientPlaySessionHandler.class.getDeclaredMethod(
+        "abortWorldlineHandoff", boolean.class);
+    abort.setAccessible(true);
+    abort.invoke(handler, true);
+  }
+
+  private static void setField(final ClientPlaySessionHandler handler, final String name,
+      final Object value) throws Exception {
+    Field field = ClientPlaySessionHandler.class.getDeclaredField(name);
+    field.setAccessible(true);
+    field.set(handler, value);
+  }
+
+  private static Object getField(final ClientPlaySessionHandler handler, final String name)
+      throws Exception {
+    Field field = ClientPlaySessionHandler.class.getDeclaredField(name);
+    field.setAccessible(true);
+    return field.get(handler);
+  }
+
+  private static void drain(final DefaultEventLoop eventLoop) {
+    eventLoop.submit(() -> { }).syncUninterruptibly();
+  }
+
+  private static void awaitCleared(final ClientPlaySessionHandler handler,
+      final DefaultEventLoop eventLoop) throws Exception {
+    for (int attempt = 0; attempt < 100; attempt++) {
+      drain(eventLoop);
+      if (getField(handler, "worldlineEnvelope") == null) {
+        return;
+      }
+      Thread.onSpinWait();
+    }
   }
 }

@@ -32,6 +32,7 @@ import org.checkerframework.checker.nullness.qual.Nullable;
 public final class HandoffControlPlane {
 
   public static final int PROTOCOL_VERSION = 4;
+  private static final int MAX_ABORT_ATTEMPTS = 3;
   private static final int MAX_COMMIT_ATTEMPTS = 3;
   private static final Logger logger = LogManager.getLogger(HandoffControlPlane.class);
 
@@ -116,7 +117,14 @@ public final class HandoffControlPlane {
     if (ownership != null) {
       return ownership;
     }
-    if (send(envelope.sourceServerId(), "ABORT_SOURCE", envelope, null, new byte[0]) == null) {
+    boolean sourceAcknowledged = false;
+    for (int attempt = 0; attempt < MAX_ABORT_ATTEMPTS; attempt++) {
+      if (send(envelope.sourceServerId(), "ABORT_SOURCE", envelope, null, new byte[0]) != null) {
+        sourceAcknowledged = true;
+        break;
+      }
+    }
+    if (!sourceAcknowledged) {
       return sessions.controlUnavailable(envelope.playerUuid());
     }
     LivePlayerSessionStore.TransitionResult result = transition(HandoffPhase.ACTIVE_SOURCE,

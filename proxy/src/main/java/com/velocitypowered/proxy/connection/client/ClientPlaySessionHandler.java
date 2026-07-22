@@ -156,6 +156,8 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
       worldlinePrepareFuture;
   private @Nullable CompletableFuture<LivePlayerSessionStore.TransitionResult>
       worldlineStageFuture;
+  private @Nullable CompletableFuture<LivePlayerSessionStore.TransitionResult>
+      worldlineAbortFuture;
   private @Nullable CompletableFuture<?> worldlinePostCommitFuture;
   private @Nullable HandoffReplayBuffer<ServerboundMovePlayerPacket> worldlineReplayBuffer;
   private final AtomicInteger worldlineClientTransitionPackets = new AtomicInteger();
@@ -1069,13 +1071,14 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
   }
 
   private void abortWorldlineHandoff(final boolean blockCrossing) {
+    if (worldlineAbortFuture != null && !worldlineAbortFuture.isDone()) {
+      return;
+    }
     final ControlEnvelope envelope = worldlineEnvelope;
     final CompletableFuture<LivePlayerSessionStore.TransitionResult> prepareFuture =
         worldlinePrepareFuture;
     final CompletableFuture<LivePlayerSessionStore.TransitionResult> stageFuture =
         worldlineStageFuture;
-    worldlineTransferId = null;
-    worldlineEnvelope = null;
     worldlinePrepareFuture = null;
     worldlineStageFuture = null;
     worldlineFreezeInProgress = false;
@@ -1087,16 +1090,18 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
       }
     }
     if (envelope == null) {
+      worldlineTransferId = null;
+      worldlineEnvelope = null;
       return;
     }
+    CompletableFuture<LivePlayerSessionStore.TransitionResult> abortFuture =
+        new CompletableFuture<>();
+    worldlineAbortFuture = abortFuture;
     Runnable abort = () -> {
-      LivePlayerSessionStore.TransitionResult result =
-          server.getWorldlineControlPlane().abort(envelope);
-      if (result.status() != LivePlayerSessionStore.Status.APPLIED
-          && result.status() != LivePlayerSessionStore.Status.ALREADY_APPLIED
-          && result.status() != LivePlayerSessionStore.Status.MISSING_SESSION) {
-        logger.warn("Worldline abort rejected for {} transfer {}: {}", player,
-            envelope.transferId(), result.status());
+      try {
+        abortFuture.complete(server.getWorldlineControlPlane().abort(envelope));
+      } catch (Throwable failure) {
+        abortFuture.completeExceptionally(failure);
       }
     };
     CompletableFuture<LivePlayerSessionStore.TransitionResult> pending =
@@ -1107,6 +1112,26 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
       // Preserve command order so a late prepare or stage cannot recreate state after abort.
       pending.whenComplete((ignored, failure) -> Thread.startVirtualThread(abort));
     }
+    abortFuture.whenCompleteAsync((result, failure) -> {
+      if (worldlineAbortFuture != abortFuture || worldlineEnvelope != envelope) {
+        return;
+      }
+      if (failure != null || !successfulAbort(result)) {
+        logger.warn("Worldline abort remains pending for {} transfer {}: {}", player,
+            envelope.transferId(), failure == null ? result.status() : failure.getMessage());
+        return;
+      }
+      worldlineAbortFuture = null;
+      worldlineTransferId = null;
+      worldlineEnvelope = null;
+    }, player.getConnection().eventLoop());
+  }
+
+  private static boolean successfulAbort(
+      final LivePlayerSessionStore.TransitionResult result) {
+    return result != null && (result.status() == LivePlayerSessionStore.Status.APPLIED
+        || result.status() == LivePlayerSessionStore.Status.ALREADY_APPLIED
+        || result.status() == LivePlayerSessionStore.Status.MISSING_SESSION);
   }
 
   private ControlEnvelope worldlineEnvelope(final UUID transferId, final String sourceServerId,
