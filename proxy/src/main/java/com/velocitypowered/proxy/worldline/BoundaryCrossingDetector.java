@@ -66,6 +66,25 @@ public final class BoundaryCrossingDetector {
         .orElseGet(Decision::forward);
   }
 
+  /** Classifies a first movement packet using backend authority when no prior position is known. */
+  public Decision classifyUnknownOrigin(final String currentServerId, final double toX) {
+    int toChunk = blockToChunk(toX);
+    Optional<StaticPartitionMap.Partition> target =
+        partitions.partitionFor(levelName, dimension, toChunk);
+    if (target.isEmpty()) {
+      return Decision.forward();
+    }
+    StaticPartitionMap.Partition targetPartition = target.orElseThrow();
+    if (targetPartition.owner().equals(currentServerId)) {
+      return nearestRemotePartition(currentServerId, toChunk)
+          .map(remote -> Decision.prepare(targetPartition, remote, entryChunk(remote, toChunk)))
+          .orElseGet(Decision::forward);
+    }
+    return partitions.nearestPartitionOwnedBy(currentServerId, toChunk)
+        .map(source -> Decision.withholdCrossing(source, targetPartition, toChunk))
+        .orElseGet(Decision::forward);
+  }
+
   private static int entryChunk(final StaticPartitionMap.Partition remote,
       final int sourceChunk) {
     if (remote.chunkMin() != null && remote.chunkMin() > sourceChunk) {

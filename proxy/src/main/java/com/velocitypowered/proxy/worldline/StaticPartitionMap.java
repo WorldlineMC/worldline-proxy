@@ -23,9 +23,11 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import org.checkerframework.checker.nullness.qual.Nullable;
 
@@ -102,6 +104,13 @@ public final class StaticPartitionMap {
         .findFirst();
   }
 
+  /** Returns the nearest configured partition owned by a backend. */
+  public Optional<Partition> nearestPartitionOwnedBy(final String serverId, final int chunkX) {
+    return partitions.stream()
+        .filter(partition -> partition.owner().equals(serverId))
+        .min(Comparator.comparingLong(partition -> partition.distanceFrom(chunkX)));
+  }
+
   /**
    * Returns the configured level name.
    */
@@ -172,6 +181,16 @@ public final class StaticPartitionMap {
     boolean contains(final int chunkX) {
       return (chunkMin == null || chunkX >= chunkMin)
           && (chunkMax == null || chunkX <= chunkMax);
+    }
+
+    private long distanceFrom(final int chunkX) {
+      if (contains(chunkX)) {
+        return 0;
+      }
+      if (chunkMin != null && chunkX < chunkMin) {
+        return (long) chunkMin - chunkX;
+      }
+      return (long) chunkX - Objects.requireNonNull(chunkMax);
     }
   }
 }

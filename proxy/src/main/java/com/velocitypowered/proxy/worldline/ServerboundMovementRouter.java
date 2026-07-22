@@ -92,9 +92,9 @@ public final class ServerboundMovementRouter {
       }
       return BoundaryCrossingDetector.Decision.forward();
     }
-    double fromX = lastX == null ? packet.getX() : lastX;
-    BoundaryCrossingDetector.Decision decision = detector.classify(currentServerId, fromX,
-        packet.getX());
+    BoundaryCrossingDetector.Decision decision = lastX == null
+        ? detector.classifyUnknownOrigin(currentServerId, packet.getX())
+        : detector.classify(currentServerId, lastX, packet.getX());
     if (crossingBlocked) {
       if (decision.action() == BoundaryCrossingDetector.Action.WITHHOLD_CROSSING) {
         return decision;

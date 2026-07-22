@@ -66,6 +66,16 @@ public class BoundaryCrossingDetectorTest {
   }
 
   @Test
+  void withholdsRemoteMovementWhenTheOriginIsNotYetKnown() throws Exception {
+    BoundaryCrossingDetector.Decision decision = detector().classifyUnknownOrigin("server-a", 0);
+
+    assertEquals(WITHHOLD_CROSSING, decision.action());
+    assertEquals("west", decision.sourcePartitionId().orElseThrow());
+    assertEquals("east", decision.remotePartitionId().orElseThrow());
+    assertEquals("server-b", decision.remoteOwner().orElseThrow());
+  }
+
+  @Test
   void floorsNegativeCoordinatesIntoMinecraftChunks() {
     assertEquals(-1, BoundaryCrossingDetector.blockToChunk(-0.1));
     assertEquals(-1, BoundaryCrossingDetector.blockToChunk(-16));

@@ -90,6 +90,15 @@ public class ServerboundMovementRouterTest {
   }
 
   @Test
+  void firstRemotePositionStartsPreparationAndIsWithheld() throws Exception {
+    ServerboundMovementRouter router = router();
+    ServerboundMovePlayerPacket.Position crossing = position(0);
+
+    assertEquals(PREPARE_AND_WITHHOLD, router.route("server-a", crossing).action());
+    assertEquals(List.of(crossing), router.bufferedPackets());
+  }
+
+  @Test
   void blocksRepeatedRemoteMovementAfterAbortUntilReturningToSource() throws Exception {
     ServerboundMovementRouter router = router();
 
