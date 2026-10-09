@@ -17,10 +17,12 @@
 
 package com.velocitypowered.proxy.connection.client;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.timeout;
 import static org.mockito.Mockito.verify;
@@ -29,6 +31,20 @@ import static org.mockito.Mockito.when;
 import com.velocitypowered.api.network.ProtocolVersion;
 import com.velocitypowered.proxy.VelocityServer;
 import com.velocitypowered.proxy.connection.MinecraftConnection;
+import com.velocitypowered.proxy.connection.backend.VelocityServerConnection;
+import com.velocitypowered.proxy.protocol.ProtocolUtils;
+import com.velocitypowered.proxy.protocol.packet.ServerboundMovePlayerPacket;
+import com.velocitypowered.proxy.worldline.BoundaryCrossingDetector;
+import com.velocitypowered.proxy.worldline.HandoffReplayBuffer;
+import com.velocitypowered.proxy.worldline.ServerboundMovementRouter;
+import com.velocitypowered.proxy.worldline.StaticPartitionMap;
+import io.netty.buffer.Unpooled;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import org.junit.jupiter.api.io.TempDir;
 import com.velocitypowered.proxy.worldline.AsyncHandoffFence;
 import com.velocitypowered.proxy.worldline.ControlEnvelope;
 import com.velocitypowered.proxy.worldline.HandoffControlPlane;
@@ -147,6 +163,155 @@ public class ClientPlaySessionHandlerWorldlineTest {
       assertNull(getField(handler, "worldlineTransferId"));
     } finally {
       eventLoop.shutdownGracefully().syncUninterruptibly();
+    }
+  }
+
+  @TempDir
+  Path tempDir;
+
+  @Test
+  void handlerWithholdsSourceReturnAndRotationWhileSnapshotIsPending() throws Exception {
+    try (MovementFixture fixture = new MovementFixture(false)) {
+      fixture.router.route("server-a", position(-0.25));
+      fixture.router.markDestinationReady();
+      setField(fixture.handler, "worldlineStageFuture", new CompletableFuture<>());
+      var crossing = position(0.25);
+      var returning = position(-0.10);
+      var rotation = new ServerboundMovePlayerPacket.Rotation();
+      assertTrue(fixture.handler.handle(crossing));
+      assertTrue(fixture.handler.handle(returning));
+      assertTrue(fixture.handler.handle(rotation));
+      assertEquals(List.of(crossing, returning, rotation), fixture.router.bufferedPackets());
+    }
+  }
+
+  @Test
+  void activationReplaysInOrderAndResetsPositionForImmediateReverseCrossing() throws Exception {
+    try (MovementFixture fixture = new MovementFixture()) {
+      fixture.router.route("server-a", position(-0.25));
+      fixture.router.markDestinationReady();
+      var crossing = position(0.25);
+      fixture.router.route("server-a", crossing);
+      HandoffReplayBuffer<ServerboundMovePlayerPacket> replay = new HandoffReplayBuffer<>(
+          fixture.transfer, 1, 1, 64);
+      fixture.router.drainBuffer().forEach(replay::append);
+      setField(fixture.handler, "worldlineReplayBuffer", replay);
+      when(fixture.control.activateDestination(fixture.envelope)).thenAnswer(ignored ->
+          fixture.sessions.markActiveDestination(PLAYER, 1, fixture.transfer));
+      when(fixture.control.cleanSource(fixture.envelope)).thenAnswer(ignored ->
+          fixture.sessions.markSourceCleaned(PLAYER, 1, fixture.transfer));
+      CountDownLatch cleanup = new CountDownLatch(1);
+      org.mockito.Mockito.doAnswer(ignored -> { cleanup.countDown(); return null; })
+          .when(fixture.player).disconnectWorldlineSourceAfterCleanup(fixture.source);
+      Method activate = ClientPlaySessionHandler.class.getDeclaredMethod(
+          "beginWorldlineActivation", ControlEnvelope.class, VelocityServerConnection.class);
+      activate.setAccessible(true);
+      fixture.eventLoop.submit(() -> {
+        try {
+          activate.invoke(fixture.handler, fixture.envelope, fixture.destination);
+        } catch (ReflectiveOperationException failure) {
+          throw new AssertionError(failure);
+        }
+      }).syncUninterruptibly();
+      assertTrue(cleanup.await(5, TimeUnit.SECONDS));
+      drain(fixture.eventLoop);
+      assertNull(getField(fixture.handler, "worldlineEnvelope"));
+      verify(fixture.destination.ensureConnected()).write(crossing);
+      verify(fixture.destination.ensureConnected()).flush();
+      assertEquals(HandoffPhase.ACTIVE_SOURCE,
+          fixture.sessions.get(PLAYER).orElseThrow().handoffPhase());
+      assertEquals("server-b", fixture.sessions.get(PLAYER).orElseThrow().authoritativeServerId());
+      when(fixture.player.getConnectedServer()).thenReturn(fixture.destination);
+      // Hold the next preparation callback: this assertion is about handler routing, not transport.
+      setField(fixture.handler, "worldlineTransferId", UUID.randomUUID());
+      assertTrue(fixture.handler.handle(position(-0.10)));
+      assertEquals("server-a", fixture.router.bufferedDecision().remoteOwner().orElseThrow());
+    }
+  }
+
+  private final class MovementFixture implements AutoCloseable {
+    final UUID transfer = UUID.randomUUID();
+    final ControlEnvelope envelope = new ControlEnvelope(4, transfer, PLAYER, CLIENT,
+        "server-a", "server-b", "west", "east", 1, 1, 0, 1, 0);
+    final DefaultEventLoop eventLoop = new DefaultEventLoop();
+    final VelocityServer server = mock(VelocityServer.class);
+    final ConnectedPlayer player = mock(ConnectedPlayer.class);
+    final MinecraftConnection connection = mock(MinecraftConnection.class);
+    final HandoffControlPlane control = mock(HandoffControlPlane.class);
+    final LivePlayerSessionStore sessions = new LivePlayerSessionStore();
+    final VelocityServerConnection source = mock(VelocityServerConnection.class, RETURNS_DEEP_STUBS);
+    final VelocityServerConnection destination = mock(VelocityServerConnection.class, RETURNS_DEEP_STUBS);
+    final ClientPlaySessionHandler handler;
+    final ServerboundMovementRouter router;
+
+    MovementFixture() throws Exception {
+      this(true);
+    }
+
+    MovementFixture(boolean committed) throws Exception {
+      Path config = tempDir.resolve("worldline.toml");
+      Files.writeString(config, """
+          [world]
+          level-name = "world"
+          dimension = "minecraft:overworld"
+          compatibility-id = "test"
+          [servers.server-a]
+          control-address = "127.0.0.1:25576"
+          [servers.server-b]
+          control-address = "127.0.0.1:25577"
+          [[partitions]]
+          id = "west"
+          owner = "server-a"
+          epoch = 1
+          chunk-x-max = -1
+          [[partitions]]
+          id = "east"
+          owner = "server-b"
+          epoch = 1
+          chunk-x-min = 0
+          """);
+      var detector = new BoundaryCrossingDetector(StaticPartitionMap.read(config),
+          "world", "minecraft:overworld", 1);
+      when(server.getWorldlineBoundaryDetector()).thenReturn(Optional.of(detector));
+      when(server.getWorldlineControlPlane()).thenReturn(control);
+      when(server.getWorldlineLiveSessions()).thenReturn(sessions);
+      when(player.getProtocolVersion()).thenReturn(ProtocolVersion.MINECRAFT_26_1);
+      when(player.getUniqueId()).thenReturn(PLAYER);
+      when(player.getConnection()).thenReturn(connection);
+      when(connection.eventLoop()).thenReturn(eventLoop);
+      when(player.getConnectedServer()).thenReturn(source);
+      when(source.getServer().getServerInfo().getName()).thenReturn("server-a");
+      when(destination.getServer().getServerInfo().getName()).thenReturn("server-b");
+      sessions.putActive(PLAYER, CLIENT, "server-a");
+      sessions.beginTransfer(PLAYER, 0, "server-a", transfer);
+      sessions.markDestinationReady(PLAYER, 0, transfer);
+      sessions.markSourceFrozen(PLAYER, 0, transfer);
+      sessions.markSnapshotStaged(PLAYER, 0, transfer);
+      if (committed) {
+        sessions.commit(PLAYER, 0, transfer, "server-a", "server-b");
+      }
+      handler = new ClientPlaySessionHandler(server, player);
+      router = (ServerboundMovementRouter) getField(handler, "worldlineMovementRouter");
+      setField(handler, "worldlineTransferId", transfer);
+      setField(handler, "worldlineEnvelope", envelope);
+      setField(handler, "worldlineSourceConnection", source);
+    }
+
+    @Override
+    public void close() {
+      eventLoop.shutdownGracefully(0, 1, TimeUnit.SECONDS).syncUninterruptibly();
+    }
+  }
+
+  private static ServerboundMovePlayerPacket.Position position(final double x) {
+    var buffer = Unpooled.buffer();
+    try {
+      buffer.writeDouble(x).writeDouble(64).writeDouble(0).writeByte(1);
+      var packet = new ServerboundMovePlayerPacket.Position();
+      packet.decode(buffer, ProtocolUtils.Direction.SERVERBOUND, ProtocolVersion.MINECRAFT_26_1);
+      return packet;
+    } finally {
+      buffer.release();
     }
   }
 

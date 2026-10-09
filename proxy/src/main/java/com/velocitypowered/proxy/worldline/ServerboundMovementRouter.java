@@ -77,21 +77,23 @@ public final class ServerboundMovementRouter {
   }
 
   /**
-   * Classifies a movement packet. Packets without coordinates always forward.
+   * Classifies movement, retaining all variants once a crossing is buffered.
    */
   public BoundaryCrossingDetector.Decision route(final String currentServerId,
       final ServerboundMovePlayerPacket packet) {
-    if (!packet.hasPosition()) {
-      if (!bufferedPackets.isEmpty()) {
-        if (prepareDeadlineNanos != 0 && ticker.getAsLong() > prepareDeadlineNanos) {
-          return BoundaryCrossingDetector.Decision.prepareTimeout(bufferedDecision);
-        }
-        if (bufferedPackets.size() >= maxBufferedPackets) {
-          return BoundaryCrossingDetector.Decision.bufferLimitExceeded(bufferedDecision);
-        }
-        bufferedPackets.add(packet);
-        return bufferedDecision;
+    // Once crossing starts, every subsequent movement belongs to the same ordered replay,
+    // including a position back on the source side. Never reclassify it against live authority.
+    if (!bufferedPackets.isEmpty()) {
+      if (prepareDeadlineNanos != 0 && ticker.getAsLong() > prepareDeadlineNanos) {
+        return BoundaryCrossingDetector.Decision.prepareTimeout(bufferedDecision);
       }
+      if (bufferedPackets.size() >= maxBufferedPackets) {
+        return BoundaryCrossingDetector.Decision.bufferLimitExceeded(bufferedDecision);
+      }
+      bufferedPackets.add(packet);
+      return bufferedDecision;
+    }
+    if (!packet.hasPosition()) {
       return BoundaryCrossingDetector.Decision.forward();
     }
     BoundaryCrossingDetector.Decision decision = lastX == null
@@ -176,6 +178,11 @@ public final class ServerboundMovementRouter {
     List<ServerboundMovePlayerPacket> packets = List.copyOf(bufferedPackets);
     clearBuffer();
     return packets;
+  }
+
+  /** Reclassifies the next positioned input against the newly installed backend authority. */
+  public void resetPositionAfterSplice() {
+    lastX = null;
   }
 
   /**

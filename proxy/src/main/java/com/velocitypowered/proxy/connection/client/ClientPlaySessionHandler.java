@@ -904,6 +904,7 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
         return;
       }
       try {
+        worldlineMovementRouter.resetPositionAfterSplice();
         destination.ensureConnected().setAutoReading(true);
         for (HandoffReplayBuffer.Entry<ServerboundMovePlayerPacket> entry : replay.drain(
             envelope.transferId(), envelope.playerSessionEpoch() + 1,
