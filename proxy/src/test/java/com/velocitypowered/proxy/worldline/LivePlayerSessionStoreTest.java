@@ -358,6 +358,52 @@ public class LivePlayerSessionStoreTest {
         UUID.fromString("00000000-0000-0000-0000-000000000005")).status());
   }
 
+  @Test
+  void retiredFailurePreservesFencesAndRejectsLateActivationAndSourceResurrection() {
+    LivePlayerSessionStore store = stagedStore();
+    assertEquals(REJECTED_MISMATCH, store.retireFailedTransfer(PLAYER, 0, TRANSFER).status());
+    store.commit(PLAYER, 0, TRANSFER, "server-a", "server-b");
+    assertEquals(REJECTED_STALE_EPOCH, store.retireFailedTransfer(PLAYER, 0, TRANSFER).status());
+    assertEquals(REJECTED_MISMATCH,
+        store.retireFailedTransfer(PLAYER, 1, UUID.randomUUID()).status());
+    assertEquals(APPLIED, store.retireFailedTransfer(PLAYER, 1, TRANSFER).status());
+    assertEquals(REJECTED_MISMATCH, store.markActiveDestination(PLAYER, 1, TRANSFER).status());
+    assertEquals(REJECTED_MISMATCH, store.markSourceCleaned(PLAYER, 1, TRANSFER).status());
+    assertEquals(REJECTED_MISMATCH, store.beginTransfer(PLAYER, 1, "server-b", TRANSFER).status());
+    assertEquals(REJECTED_MISMATCH, store.retireTransfer(PLAYER, 1, TRANSFER, "server-b").status());
+    assertEquals(REJECTED_STALE_EPOCH, store.abortTransfer(PLAYER, 0, TRANSFER, "server-a").status());
+    assertFalse(store.mayForwardGameplay(binding("server-b", 1, 1, TRANSFER)));
+    assertFalse(store.mayForwardGameplay(binding("server-a", 0, 0, null)));
+    store.putActive(PLAYER, UUID.randomUUID(), "server-a");
+    assertEquals(CLIENT, store.get(PLAYER).orElseThrow().clientConnectionId());
+    assertEquals("server-b", store.get(PLAYER).orElseThrow().authoritativeServerId());
+    assertEquals(HandoffPhase.RETIRED, store.get(PLAYER).orElseThrow().handoffPhase());
+  }
+
+  @Test
+  void racingActivationCannotResurrectOrPreventFailureRetirement() throws Exception {
+    try (var workers = java.util.concurrent.Executors.newFixedThreadPool(2)) {
+      for (int attempt = 0; attempt < 100; attempt++) {
+        LivePlayerSessionStore store = stagedStore();
+        store.commit(PLAYER, 0, TRANSFER, "server-a", "server-b");
+        var start = new java.util.concurrent.CyclicBarrier(2);
+        var activation = workers.submit(() -> {
+          start.await(5, java.util.concurrent.TimeUnit.SECONDS);
+          return store.markActiveDestination(PLAYER, 1, TRANSFER);
+        });
+        var retirement = workers.submit(() -> {
+          start.await(5, java.util.concurrent.TimeUnit.SECONDS);
+          return store.retireFailedTransfer(PLAYER, 1, TRANSFER);
+        });
+        var activated = activation.get(5, java.util.concurrent.TimeUnit.SECONDS).status();
+        assertTrue(activated == APPLIED || activated == REJECTED_MISMATCH);
+        assertEquals(APPLIED, retirement.get(5, java.util.concurrent.TimeUnit.SECONDS).status());
+        assertEquals(HandoffPhase.RETIRED, store.get(PLAYER).orElseThrow().handoffPhase());
+        assertFalse(store.mayForwardGameplay(binding("server-b", 1, 1, TRANSFER)));
+      }
+    }
+  }
+
   private static LivePlayerSessionStore stagedStore() {
     LivePlayerSessionStore store = new LivePlayerSessionStore();
     store.putActive(PLAYER, CLIENT, "server-a");

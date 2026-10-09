@@ -264,6 +264,34 @@ public final class HandoffControlPlane {
     }).result();
   }
 
+  /**
+   * Acknowledges source resource cleanup on the failure path without claiming successful
+   * destination activation. The coordinator retires the proxy record only after both remote
+   * terminal commands acknowledge; otherwise its committed state remains available for retry.
+   */
+  public LivePlayerSessionStore.TransitionResult cleanSourceAfterFailure(
+      final ControlEnvelope envelope) {
+    validateProtocol(envelope);
+    ControlEnvelope committed = committedEnvelope(envelope);
+    return terminalRetry.execute(() -> {
+      LivePlayerSession current = sessions.get(envelope.playerUuid()).orElse(null);
+      if (current == null) {
+        return LivePlayerSessionStore.TransitionResult.missing();
+      }
+      if (!current.clientConnectionId().equals(committed.clientConnectionId())
+          || !committed.transferId().equals(current.activeTransferId())
+          || current.playerSessionEpoch() != committed.playerSessionEpoch()
+          || current.routeGeneration() != committed.routeGeneration()
+          || !current.authoritativeServerId().equals(committed.destinationServerId())) {
+        return LivePlayerSessionStore.TransitionResult.rejectedMismatch(current);
+      }
+      LivePlayerSessionStore.TransitionResult rejection = beforeServerCommand(
+          envelope.sourceServerId(), "CLEAN_SOURCE", committed);
+      return rejection == null
+          ? LivePlayerSessionStore.TransitionResult.alreadyApplied(current) : rejection;
+    }).result();
+  }
+
   /** Releases destination resources after a terminal post-commit failure. */
   public LivePlayerSessionStore.TransitionResult retireDestination(
       final ControlEnvelope envelope) {

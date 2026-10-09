@@ -19,12 +19,18 @@ package com.velocitypowered.proxy.connection.client;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyDouble;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.timeout;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -34,31 +40,33 @@ import com.velocitypowered.proxy.connection.MinecraftConnection;
 import com.velocitypowered.proxy.connection.backend.VelocityServerConnection;
 import com.velocitypowered.proxy.protocol.ProtocolUtils;
 import com.velocitypowered.proxy.protocol.packet.ServerboundMovePlayerPacket;
-import com.velocitypowered.proxy.worldline.BoundaryCrossingDetector;
-import com.velocitypowered.proxy.worldline.HandoffReplayBuffer;
-import com.velocitypowered.proxy.worldline.ServerboundMovementRouter;
-import com.velocitypowered.proxy.worldline.StaticPartitionMap;
-import io.netty.buffer.Unpooled;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.util.List;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.TimeUnit;
-import org.junit.jupiter.api.io.TempDir;
 import com.velocitypowered.proxy.worldline.AsyncHandoffFence;
+import com.velocitypowered.proxy.worldline.BoundaryCrossingDetector;
 import com.velocitypowered.proxy.worldline.ControlEnvelope;
 import com.velocitypowered.proxy.worldline.HandoffControlPlane;
 import com.velocitypowered.proxy.worldline.HandoffPhase;
+import com.velocitypowered.proxy.worldline.HandoffReplayBuffer;
 import com.velocitypowered.proxy.worldline.LivePlayerSession;
 import com.velocitypowered.proxy.worldline.LivePlayerSessionStore;
+import com.velocitypowered.proxy.worldline.PrepareTarget;
+import com.velocitypowered.proxy.worldline.ServerboundMovementRouter;
+import com.velocitypowered.proxy.worldline.StaticPartitionMap;
+import io.netty.buffer.Unpooled;
 import io.netty.channel.DefaultEventLoop;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+import org.mockito.ArgumentCaptor;
 
 public class ClientPlaySessionHandlerWorldlineTest {
 
@@ -201,7 +209,7 @@ public class ClientPlaySessionHandlerWorldlineTest {
       when(fixture.control.cleanSource(fixture.envelope)).thenAnswer(ignored ->
           fixture.sessions.markSourceCleaned(PLAYER, 1, fixture.transfer));
       CountDownLatch cleanup = new CountDownLatch(1);
-      org.mockito.Mockito.doAnswer(ignored -> { cleanup.countDown(); return null; })
+      doAnswer(ignored -> { cleanup.countDown(); return null; })
           .when(fixture.player).disconnectWorldlineSourceAfterCleanup(fixture.source);
       Method activate = ClientPlaySessionHandler.class.getDeclaredMethod(
           "beginWorldlineActivation", ControlEnvelope.class, VelocityServerConnection.class);
@@ -229,6 +237,133 @@ public class ClientPlaySessionHandlerWorldlineTest {
     }
   }
 
+  @Test
+  void reverseCrossingDuringCleanupStartsAfterThePreviousTransferRetires() throws Exception {
+    checkMovementDuringCleanup(true);
+  }
+
+  @Test
+  void ordinaryMovementDuringCleanupDoesNotAbortCommittedTransfer() throws Exception {
+    checkMovementDuringCleanup(false);
+  }
+
+  private void checkMovementDuringCleanup(boolean reverse) throws Exception {
+    try (MovementFixture fixture = new MovementFixture()) {
+      fixture.router.route("server-a", position(-0.25));
+      HandoffReplayBuffer<ServerboundMovePlayerPacket> replay = new HandoffReplayBuffer<>(
+          fixture.transfer, 1, 1, 64);
+      replay.append(position(0.25));
+      setField(fixture.handler, "worldlineReplayBuffer", replay);
+      when(fixture.player.getConnectedServer()).thenReturn(fixture.destination);
+      when(fixture.control.activateDestination(fixture.envelope)).thenAnswer(ignored ->
+          fixture.sessions.markActiveDestination(PLAYER, 1, fixture.transfer));
+      CountDownLatch cleanupEntered = new CountDownLatch(1);
+      CountDownLatch releaseCleanup = new CountDownLatch(1);
+      when(fixture.control.cleanSource(fixture.envelope)).thenAnswer(ignored -> {
+        cleanupEntered.countDown();
+        if (!releaseCleanup.await(5, TimeUnit.SECONDS)) {
+          throw new AssertionError("cleanup test latch timed out");
+        }
+        return fixture.sessions.markSourceCleaned(PLAYER, 1, fixture.transfer);
+      });
+      when(fixture.control.prepareTarget(any(),
+          anyDouble(), anyDouble(),
+          anyDouble())).thenReturn(
+              new PrepareTarget(
+                  "Test", "world", "minecraft:overworld", "test", -0.10, 64, 0, 1));
+      when(fixture.control.prepare(any(),
+          any())).thenReturn(new LivePlayerSessionStore.TransitionResult(
+              LivePlayerSessionStore.Status.CONTROL_UNAVAILABLE, fixture.sessions.get(PLAYER),
+              fixture.sessions.get(PLAYER), 0));
+      Method activate = ClientPlaySessionHandler.class.getDeclaredMethod(
+          "beginWorldlineActivation", ControlEnvelope.class, VelocityServerConnection.class);
+      activate.setAccessible(true);
+      try {
+        fixture.eventLoop.submit(() -> {
+          try {
+            activate.invoke(fixture.handler, fixture.envelope, fixture.destination);
+          } catch (ReflectiveOperationException failure) {
+            throw new AssertionError(failure);
+          }
+        }).syncUninterruptibly();
+        assertTrue(cleanupEntered.await(5, TimeUnit.SECONDS));
+        var result = fixture.eventLoop.submit(() -> fixture.handler.handle(
+            position(reverse ? -0.10 : 32)));
+        result.syncUninterruptibly();
+        assertEquals(reverse, result.getNow());
+        verify(fixture.control, never()).abort(fixture.envelope);
+        verify(fixture.control, never()).prepare(
+            any(), any());
+      } finally {
+        releaseCleanup.countDown();
+      }
+      if (reverse) {
+        var next = ArgumentCaptor.forClass(ControlEnvelope.class);
+        verify(fixture.control, timeout(5_000)).prepare(next.capture(),
+            any());
+        assertEquals("server-b", next.getValue().sourceServerId());
+        assertEquals("server-a", next.getValue().destinationServerId());
+        assertEquals(1, next.getValue().playerSessionEpoch());
+        assertNotEquals(fixture.transfer, next.getValue().transferId());
+      } else {
+        verify(fixture.player, timeout(5_000)).disconnectWorldlineSourceAfterCleanup(fixture.source);
+        drain(fixture.eventLoop);
+        assertNull(getField(fixture.handler, "worldlineEnvelope"));
+      }
+    }
+  }
+
+  @Test
+  void failedActivationCleanupRetiresRecordAndTearsDownExactlyOnce() throws Exception {
+    checkFailedActivationCleanup(true);
+  }
+
+  @Test
+  void unacknowledgedFailureCleanupKeepsCommittedRecoveryRecord() throws Exception {
+    checkFailedActivationCleanup(false);
+  }
+
+  private void checkFailedActivationCleanup(boolean acknowledged) throws Exception {
+    try (MovementFixture fixture = new MovementFixture()) {
+      var current = fixture.sessions.get(PLAYER);
+      var ack = new LivePlayerSessionStore.TransitionResult(
+          LivePlayerSessionStore.Status.ALREADY_APPLIED, current, current, 0);
+      var unavailable = new LivePlayerSessionStore.TransitionResult(
+          LivePlayerSessionStore.Status.CONTROL_UNAVAILABLE, current, current, 0);
+      when(fixture.control.retireDestination(fixture.envelope)).thenReturn(ack);
+      when(fixture.control.cleanSourceAfterFailure(fixture.envelope))
+          .thenReturn(acknowledged ? ack : unavailable);
+      HandoffReplayBuffer<ServerboundMovePlayerPacket> replay = new HandoffReplayBuffer<>(
+          fixture.transfer, 1, 1, 64);
+      replay.append(position(0.25));
+      setField(fixture.handler, "worldlineReplayBuffer", replay);
+      Method fail = ClientPlaySessionHandler.class.getDeclaredMethod(
+          "failWorldlinePostCommit", ControlEnvelope.class, String.class);
+      fail.setAccessible(true);
+      fixture.eventLoop.submit(() -> {
+        try {
+          fail.invoke(fixture.handler, fixture.envelope, "injected activation rejection");
+          fail.invoke(fixture.handler, fixture.envelope, "racing deadline");
+        } catch (ReflectiveOperationException failure) {
+          throw new AssertionError(failure);
+        }
+      }).syncUninterruptibly();
+      verify(fixture.player, timeout(5_000)).disconnect(any());
+      drain(fixture.eventLoop);
+      verify(fixture.control).retireDestination(fixture.envelope);
+      verify(fixture.control).cleanSourceAfterFailure(fixture.envelope);
+      verify(fixture.control, never()).abort(fixture.envelope);
+      assertNull(getField(fixture.handler, "worldlineReplayBuffer"));
+      assertEquals(0, replay.size());
+      assertEquals(acknowledged ? HandoffPhase.RETIRED : HandoffPhase.COMMITTED,
+          fixture.sessions.get(PLAYER).orElseThrow().handoffPhase());
+      assertEquals("server-b", fixture.sessions.get(PLAYER).orElseThrow().authoritativeServerId());
+      verify(fixture.player, times(acknowledged ? 1 : 0)).teardown();
+      verify(fixture.player, times(acknowledged ? 1 : 0))
+          .disconnectWorldlineSourceAfterCleanup(fixture.source);
+    }
+  }
+
   private final class MovementFixture implements AutoCloseable {
     final UUID transfer = UUID.randomUUID();
     final ControlEnvelope envelope = new ControlEnvelope(4, transfer, PLAYER, CLIENT,
@@ -240,7 +375,8 @@ public class ClientPlaySessionHandlerWorldlineTest {
     final HandoffControlPlane control = mock(HandoffControlPlane.class);
     final LivePlayerSessionStore sessions = new LivePlayerSessionStore();
     final VelocityServerConnection source = mock(VelocityServerConnection.class, RETURNS_DEEP_STUBS);
-    final VelocityServerConnection destination = mock(VelocityServerConnection.class, RETURNS_DEEP_STUBS);
+    final VelocityServerConnection destination =
+        mock(VelocityServerConnection.class, RETURNS_DEEP_STUBS);
     final ClientPlaySessionHandler handler;
     final ServerboundMovementRouter router;
 
@@ -282,6 +418,7 @@ public class ClientPlaySessionHandlerWorldlineTest {
       when(player.getConnectedServer()).thenReturn(source);
       when(source.getServer().getServerInfo().getName()).thenReturn("server-a");
       when(destination.getServer().getServerInfo().getName()).thenReturn("server-b");
+      when(destination.getServerInfo().getName()).thenReturn("server-b");
       sessions.putActive(PLAYER, CLIENT, "server-a");
       sessions.beginTransfer(PLAYER, 0, "server-a", transfer);
       sessions.markDestinationReady(PLAYER, 0, transfer);

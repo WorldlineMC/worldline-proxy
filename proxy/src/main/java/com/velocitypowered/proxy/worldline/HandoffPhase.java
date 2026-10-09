@@ -28,7 +28,9 @@ public enum HandoffPhase {
   SNAPSHOT_STAGED,
   COMMITTED,
   ACTIVE_DESTINATION,
-  SOURCE_CLEANED;
+  SOURCE_CLEANED,
+  // Both remote terminal commands acknowledged; committed identity retained for recovery.
+  RETIRED;
 
   /**
    * Returns whether this phase may transition directly to the supplied phase.
@@ -40,9 +42,10 @@ public enum HandoffPhase {
       case DESTINATION_READY -> next == SOURCE_FROZEN || next == ACTIVE_SOURCE;
       case SOURCE_FROZEN -> next == SNAPSHOT_STAGED || next == ACTIVE_SOURCE;
       case SNAPSHOT_STAGED -> next == COMMITTED || next == ACTIVE_SOURCE;
-      case COMMITTED -> next == ACTIVE_DESTINATION;
-      case ACTIVE_DESTINATION -> next == SOURCE_CLEANED;
-      case SOURCE_CLEANED -> next == ACTIVE_SOURCE;
+      case COMMITTED -> next == ACTIVE_DESTINATION || next == RETIRED;
+      case ACTIVE_DESTINATION -> next == SOURCE_CLEANED || next == RETIRED;
+      case SOURCE_CLEANED -> next == ACTIVE_SOURCE || next == RETIRED;
+      case RETIRED -> false;
     };
   }
 }

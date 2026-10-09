@@ -90,7 +90,7 @@ public final class LivePlayerSessionStore {
       case ACTIVE_DESTINATION, SOURCE_CLEANED ->
           current.activeTransferId() != null
               && current.activeTransferId().equals(binding.transferId());
-      case COMMITTED -> false;
+      case COMMITTED, RETIRED -> false;
     };
   }
 
@@ -147,6 +147,10 @@ public final class LivePlayerSessionStore {
       }
       if (current.playerSessionEpoch() != expectedEpoch) {
         result.set(TransitionResult.rejectedStaleEpoch(current));
+        return current;
+      }
+      if (current.handoffPhase() == HandoffPhase.RETIRED) {
+        result.set(TransitionResult.rejectedMismatch(current));
         return current;
       }
       if (current.activeTransferId() != null) {
@@ -213,6 +217,15 @@ public final class LivePlayerSessionStore {
       final UUID transferId) {
     return phase(playerUuid, expectedEpoch, transferId, HandoffPhase.ACTIVE_DESTINATION,
         HandoffPhase.SOURCE_CLEANED);
+  }
+
+  /**
+   * Retains the committed identity as a non-forwarding tombstone once failed-handoff resource
+   * retirement and source cleanup have both acknowledged. Never fabricates destination activation.
+   */
+  public TransitionResult retireFailedTransfer(final UUID playerUuid, final long expectedEpoch,
+      final UUID transferId) {
+    return phase(playerUuid, expectedEpoch, transferId, HandoffPhase.COMMITTED, HandoffPhase.RETIRED);
   }
 
   /** Retires terminal transfer identity while preserving destination authority and fences. */
@@ -335,12 +348,23 @@ public final class LivePlayerSessionStore {
         result.set(TransitionResult.rejectedStaleEpoch(current));
         return current;
       }
+      // A retired failure is not a successful later point on the activation path.
+      if (current.handoffPhase() == HandoffPhase.RETIRED && nextPhase != HandoffPhase.RETIRED) {
+        result.set(TransitionResult.rejectedMismatch(current));
+        return current;
+      }
       if (transferId.equals(current.activeTransferId())
           && current.handoffPhase().ordinal() >= nextPhase.ordinal()) {
         result.set(TransitionResult.alreadyApplied(current));
         return current;
       }
-      if (!transferId.equals(current.activeTransferId()) || current.handoffPhase() != expectedPhase
+      // Failure retirement is legal from every committed phase. Test it inside the same
+      // atomic update so an activation completion racing cleanup cannot strand the record.
+      boolean expectedPhaseMatches = current.handoffPhase() == expectedPhase
+          || (nextPhase == HandoffPhase.RETIRED
+              && (current.handoffPhase() == HandoffPhase.ACTIVE_DESTINATION
+                  || current.handoffPhase() == HandoffPhase.SOURCE_CLEANED));
+      if (!transferId.equals(current.activeTransferId()) || !expectedPhaseMatches
           || !current.handoffPhase().canTransitionTo(nextPhase)) {
         result.set(TransitionResult.rejectedMismatch(current));
         return current;

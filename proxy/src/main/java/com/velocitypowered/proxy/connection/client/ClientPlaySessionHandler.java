@@ -632,7 +632,11 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
     }
     if (decision.action() == BoundaryCrossingDetector.Action.BUFFER_LIMIT_EXCEEDED
         || decision.action() == BoundaryCrossingDetector.Action.PREPARE_TIMEOUT) {
-      abortWorldlineHandoff(true);
+      if (worldlineEnvelope != null && worldlineCommitted(worldlineEnvelope)) {
+        failWorldlinePostCommit(worldlineEnvelope, "next crossing buffer " + decision.action());
+      } else {
+        abortWorldlineHandoff(true);
+      }
       logger.warn("Worldline {} for {} crossing from {} to {}; dropping input",
           switch (decision.action()) {
             case PREPARE_TIMEOUT -> "prepare timed out";
@@ -642,6 +646,7 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
       return true;
     }
     if (decision.action() == BoundaryCrossingDetector.Action.FORWARD
+        && worldlinePostCommitFuture == null
         && worldlineTransferId != null && !worldlineMovementRouter.hasBufferedInput()) {
       abortWorldlineHandoff();
       logger.info("Worldline discarded preparation for {} after leaving the boundary", player);
@@ -977,6 +982,16 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
             + "client_transition_packets={}",
         envelope.transferId(), player, envelope.playerSessionEpoch() + 1,
         envelope.routeGeneration() + 1, worldlineClientTransitionPackets.get());
+    // A new crossing may have arrived after replay but before old-source cleanup completed.
+    // Start its preparation only now that the previous transfer is fully retired.
+    if (worldlineMovementRouter != null && worldlineMovementRouter.hasBufferedInput()) {
+      VelocityServerConnection current = player.getConnectedServer();
+      if (current != null) {
+        beginWorldlinePreparation(current.getServerInfo().getName(),
+            worldlineMovementRouter.bufferedDecision(),
+            worldlineMovementRouter.bufferedPackets().get(0));
+      }
+    }
   }
 
   /** Records a backend packet that would have exposed the internal splice to the client. */
@@ -1016,7 +1031,7 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
       boolean sourceCleaned = false;
       try {
         LivePlayerSessionStore.TransitionResult cleaned =
-            server.getWorldlineControlPlane().cleanSource(envelope);
+            server.getWorldlineControlPlane().cleanSourceAfterFailure(envelope);
         sourceCleaned = successful(cleaned);
         if (!sourceCleaned) {
           logger.error("Worldline retained pending source cleanup for {} transfer={} status={}",
@@ -1035,7 +1050,18 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
         player.disconnect(Component.translatable("velocity.error.player-connection-error",
             NamedTextColor.RED));
         if (terminalCommandsCompleted) {
-          player.teardown();
+          LivePlayerSessionStore.TransitionResult retired = server.getWorldlineLiveSessions()
+              .retireFailedTransfer(envelope.playerUuid(), envelope.playerSessionEpoch() + 1,
+                  envelope.transferId());
+          if (successful(retired)) {
+            player.teardown();
+            worldlinePostCommitFuture = null;
+            worldlineSourceConnection = null;
+            worldlineDestinationConnection = null;
+          } else {
+            logger.error("Worldline failed to record terminal cleanup transfer={} status={}",
+                envelope.transferId(), retired.status());
+          }
         }
       });
     });
