@@ -36,6 +36,7 @@ public final class HandoffReplayGate {
       final boolean transferActive) {
     return transferActive && (phase == HandoffPhase.COMMITTED
         || phase == HandoffPhase.ACTIVE_DESTINATION
-        || phase == HandoffPhase.SOURCE_CLEANED);
+        || phase == HandoffPhase.SOURCE_CLEANED
+        || phase == HandoffPhase.RETIRED);
   }
 }

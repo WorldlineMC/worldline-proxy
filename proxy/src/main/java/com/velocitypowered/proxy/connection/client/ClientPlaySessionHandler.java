@@ -100,6 +100,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
+import java.util.Optional;
 import java.util.Queue;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
@@ -632,7 +633,11 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
     }
     if (decision.action() == BoundaryCrossingDetector.Action.BUFFER_LIMIT_EXCEEDED
         || decision.action() == BoundaryCrossingDetector.Action.PREPARE_TIMEOUT) {
-      abortWorldlineHandoff(true);
+      if (worldlineEnvelope != null && worldlineCommitted(worldlineEnvelope)) {
+        failWorldlinePostCommit(worldlineEnvelope, "next crossing buffer " + decision.action());
+      } else {
+        abortWorldlineHandoff(true);
+      }
       logger.warn("Worldline {} for {} crossing from {} to {}; dropping input",
           switch (decision.action()) {
             case PREPARE_TIMEOUT -> "prepare timed out";
@@ -642,6 +647,7 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
       return true;
     }
     if (decision.action() == BoundaryCrossingDetector.Action.FORWARD
+        && worldlinePostCommitFuture == null
         && worldlineTransferId != null && !worldlineMovementRouter.hasBufferedInput()) {
       abortWorldlineHandoff();
       logger.info("Worldline discarded preparation for {} after leaving the boundary", player);
@@ -684,14 +690,19 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
       return;
     }
     LivePlayerSessionStore sessions = server.getWorldlineLiveSessions();
-    if (sessions.get(player.getUniqueId()).isEmpty()) {
-      sessions.putActive(player.getUniqueId(), worldlineClientConnectionId, serverId);
-    }
-    LivePlayerSession liveSession = sessions.get(player.getUniqueId()).orElseThrow();
     VelocityServerConnection sourceConnection = player.getConnectedServer();
     if (sourceConnection == null) {
       return;
     }
+    Optional<LivePlayerSession> registered = sessions.registerAuthenticatedConnection(
+        player.getUniqueId(), worldlineClientConnectionId, serverId,
+        () -> !player.getConnection().isClosed()
+            && player.getConnectedServer() == sourceConnection
+            && server.getPlayer(player.getUniqueId()).orElse(null) == player);
+    if (registered.isEmpty()) {
+      return;
+    }
+    LivePlayerSession liveSession = registered.orElseThrow();
     BackendSessionBinding steadyBinding = new BackendSessionBinding(player.getUniqueId(),
         liveSession.clientConnectionId(), serverId, liveSession.playerSessionEpoch(),
         liveSession.routeGeneration(), null);
@@ -904,6 +915,7 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
         return;
       }
       try {
+        worldlineMovementRouter.resetPositionAfterSplice();
         destination.ensureConnected().setAutoReading(true);
         for (HandoffReplayBuffer.Entry<ServerboundMovePlayerPacket> entry : replay.drain(
             envelope.transferId(), envelope.playerSessionEpoch() + 1,
@@ -976,6 +988,16 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
             + "client_transition_packets={}",
         envelope.transferId(), player, envelope.playerSessionEpoch() + 1,
         envelope.routeGeneration() + 1, worldlineClientTransitionPackets.get());
+    // A new crossing may have arrived after replay but before old-source cleanup completed.
+    // Start its preparation only now that the previous transfer is fully retired.
+    if (worldlineMovementRouter != null && worldlineMovementRouter.hasBufferedInput()) {
+      VelocityServerConnection current = player.getConnectedServer();
+      if (current != null) {
+        beginWorldlinePreparation(current.getServerInfo().getName(),
+            worldlineMovementRouter.bufferedDecision(),
+            worldlineMovementRouter.bufferedPackets().get(0));
+      }
+    }
   }
 
   /** Records a backend packet that would have exposed the internal splice to the client. */
@@ -1015,7 +1037,7 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
       boolean sourceCleaned = false;
       try {
         LivePlayerSessionStore.TransitionResult cleaned =
-            server.getWorldlineControlPlane().cleanSource(envelope);
+            server.getWorldlineControlPlane().cleanSourceAfterFailure(envelope);
         sourceCleaned = successful(cleaned);
         if (!sourceCleaned) {
           logger.error("Worldline retained pending source cleanup for {} transfer={} status={}",
@@ -1034,7 +1056,18 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
         player.disconnect(Component.translatable("velocity.error.player-connection-error",
             NamedTextColor.RED));
         if (terminalCommandsCompleted) {
-          player.teardown();
+          LivePlayerSessionStore.TransitionResult retired = server.getWorldlineLiveSessions()
+              .retireFailedTransfer(envelope.playerUuid(), envelope.playerSessionEpoch() + 1,
+                  envelope.transferId());
+          if (successful(retired)) {
+            player.teardown();
+            worldlinePostCommitFuture = null;
+            worldlineSourceConnection = null;
+            worldlineDestinationConnection = null;
+          } else {
+            logger.error("Worldline failed to record terminal cleanup transfer={} status={}",
+                envelope.transferId(), retired.status());
+          }
         }
       });
     });
@@ -1286,6 +1319,11 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
 
   @Override
   public void disconnected() {
+    // The terminal worker owns teardown. Its live record may already have moved to bounded
+    // history, so absence must never reclassify this old connection as a pre-commit abort.
+    if (worldlinePostCommitTerminated) {
+      return;
+    }
     if (worldlineEnvelope != null && worldlineCommitted(worldlineEnvelope)) {
       failWorldlinePostCommit(worldlineEnvelope, "client disconnected after commit");
       return;

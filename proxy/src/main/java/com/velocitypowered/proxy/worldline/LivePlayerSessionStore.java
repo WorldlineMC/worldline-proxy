@@ -17,11 +17,16 @@
 
 package com.velocitypowered.proxy.worldline;
 
+import com.github.benmanes.caffeine.cache.Cache;
+import com.github.benmanes.caffeine.cache.Caffeine;
+import com.github.benmanes.caffeine.cache.Ticker;
+import java.time.Duration;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BooleanSupplier;
 import org.checkerframework.checker.nullness.qual.Nullable;
 
 /**
@@ -32,6 +37,7 @@ public final class LivePlayerSessionStore {
   private final Map<UUID, LivePlayerSession> sessions = new ConcurrentHashMap<>();
   private final Map<UUID, Long> phaseEnteredNanos = new ConcurrentHashMap<>();
   private final TransitionHook transitionHook;
+  private final Cache<UUID, LivePlayerSession> retiredTransfers;
 
   /**
    * Creates a store with no injected transition failures.
@@ -45,7 +51,14 @@ public final class LivePlayerSessionStore {
    * Creates a store with a hook invoked before each real state transition.
    */
   public LivePlayerSessionStore(final TransitionHook transitionHook) {
+    this(transitionHook, 1024, Duration.ofMinutes(5), Ticker.systemTicker());
+  }
+
+  LivePlayerSessionStore(final TransitionHook transitionHook, final long terminalCapacity,
+      final Duration terminalRetention, final Ticker ticker) {
     this.transitionHook = transitionHook;
+    this.retiredTransfers = Caffeine.newBuilder().maximumSize(terminalCapacity)
+        .expireAfterWrite(terminalRetention).ticker(ticker).build();
   }
 
   /**
@@ -62,6 +75,45 @@ public final class LivePlayerSessionStore {
           HandoffPhase.ACTIVE_SOURCE);
     });
     phaseEnteredNanos.putIfAbsent(playerUuid, System.nanoTime());
+  }
+
+  /**
+   * Registers a backend-selected, authenticated connection. The caller's current-player check
+   * runs inside the per-player atomic update, so a delayed old handler cannot replace a newer
+   * registration. An unresolved transfer must finish cleanup before another connection replaces it.
+   */
+  public Optional<LivePlayerSession> registerAuthenticatedConnection(final UUID playerUuid,
+      final UUID clientConnectionId, final String serverId, final BooleanSupplier isCurrentPlayer) {
+    AtomicReference<LivePlayerSession> registered = new AtomicReference<>();
+    sessions.compute(playerUuid, (ignored, current) -> {
+      if (!isCurrentPlayer.getAsBoolean()) {
+        return current;
+      }
+      if (current != null && current.clientConnectionId().equals(clientConnectionId)) {
+        registered.set(current);
+        return current;
+      }
+      if (current != null && (current.activeTransferId() != null
+          || current.handoffPhase() != HandoffPhase.ACTIVE_SOURCE)) {
+        return current;
+      }
+      LivePlayerSession next = new LivePlayerSession(playerUuid, clientConnectionId, serverId,
+          0, 0, null, HandoffPhase.ACTIVE_SOURCE);
+      phaseEnteredNanos.put(playerUuid, System.nanoTime());
+      registered.set(next);
+      return next;
+    });
+    return Optional.ofNullable(registered.get());
+  }
+
+  /** Bounded diagnostic/idempotency history; never consulted as live forwarding authority. */
+  public Optional<LivePlayerSession> retiredTransfer(final UUID transferId) {
+    return Optional.ofNullable(retiredTransfers.getIfPresent(transferId));
+  }
+
+  long retainedTerminalCount() {
+    retiredTransfers.cleanUp();
+    return retiredTransfers.estimatedSize();
   }
 
   /**
@@ -90,7 +142,7 @@ public final class LivePlayerSessionStore {
       case ACTIVE_DESTINATION, SOURCE_CLEANED ->
           current.activeTransferId() != null
               && current.activeTransferId().equals(binding.transferId());
-      case COMMITTED -> false;
+      case COMMITTED, RETIRED -> false;
     };
   }
 
@@ -139,14 +191,29 @@ public final class LivePlayerSessionStore {
    */
   public TransitionResult beginTransfer(final UUID playerUuid, final long expectedEpoch,
       final String expectedSourceServerId, final UUID transferId) {
+    return beginTransfer(playerUuid, null, expectedEpoch, expectedSourceServerId, transferId);
+  }
+
+  /** Starts preparation only for the originating authenticated client connection. */
+  public TransitionResult beginTransfer(final UUID playerUuid,
+      final @Nullable UUID clientConnectionId, final long expectedEpoch,
+      final String expectedSourceServerId, final UUID transferId) {
     AtomicReference<TransitionResult> result = new AtomicReference<>();
     sessions.compute(playerUuid, (ignored, current) -> {
       if (current == null) {
         result.set(TransitionResult.missing());
         return null;
       }
+      if (clientConnectionId != null && !current.clientConnectionId().equals(clientConnectionId)) {
+        result.set(TransitionResult.rejectedMismatch(current));
+        return current;
+      }
       if (current.playerSessionEpoch() != expectedEpoch) {
         result.set(TransitionResult.rejectedStaleEpoch(current));
+        return current;
+      }
+      if (current.handoffPhase() == HandoffPhase.RETIRED) {
+        result.set(TransitionResult.rejectedMismatch(current));
         return current;
       }
       if (current.activeTransferId() != null) {
@@ -213,6 +280,45 @@ public final class LivePlayerSessionStore {
       final UUID transferId) {
     return phase(playerUuid, expectedEpoch, transferId, HandoffPhase.ACTIVE_DESTINATION,
         HandoffPhase.SOURCE_CLEANED);
+  }
+
+  /**
+   * Retains the committed identity as a non-forwarding tombstone once failed-handoff resource
+   * retirement and source cleanup have both acknowledged. Never fabricates destination activation.
+   */
+  public TransitionResult retireFailedTransfer(final UUID playerUuid, final long expectedEpoch,
+      final UUID transferId) {
+    AtomicReference<TransitionResult> result = new AtomicReference<>();
+    sessions.compute(playerUuid, (ignored, current) -> {
+      LivePlayerSession retired = retiredTransfers.getIfPresent(transferId);
+      if (retired != null && retired.playerUuid().equals(playerUuid)
+          && retired.playerSessionEpoch() == expectedEpoch) {
+        result.set(TransitionResult.alreadyApplied(retired));
+        return current;
+      }
+      if (current == null) {
+        result.set(TransitionResult.missing());
+        return null;
+      }
+      if (current.playerSessionEpoch() != expectedEpoch) {
+        result.set(TransitionResult.rejectedStaleEpoch(current));
+        return current;
+      }
+      if (!transferId.equals(current.activeTransferId())
+          || !current.handoffPhase().canTransitionTo(HandoffPhase.RETIRED)) {
+        result.set(TransitionResult.rejectedMismatch(current));
+        return current;
+      }
+      LivePlayerSession terminal = new LivePlayerSession(current.playerUuid(),
+          current.clientConnectionId(), current.authoritativeServerId(), current.playerSessionEpoch(),
+          current.routeGeneration(), transferId, HandoffPhase.RETIRED);
+      apply("retireFailedTransfer", current, terminal, result);
+      retiredTransfers.put(transferId, terminal);
+      retiredTransfers.cleanUp();
+      phaseEnteredNanos.remove(playerUuid);
+      return null;
+    });
+    return result.get();
   }
 
   /** Retires terminal transfer identity while preserving destination authority and fences. */
@@ -335,12 +441,23 @@ public final class LivePlayerSessionStore {
         result.set(TransitionResult.rejectedStaleEpoch(current));
         return current;
       }
+      // A retired failure is not a successful later point on the activation path.
+      if (current.handoffPhase() == HandoffPhase.RETIRED && nextPhase != HandoffPhase.RETIRED) {
+        result.set(TransitionResult.rejectedMismatch(current));
+        return current;
+      }
       if (transferId.equals(current.activeTransferId())
           && current.handoffPhase().ordinal() >= nextPhase.ordinal()) {
         result.set(TransitionResult.alreadyApplied(current));
         return current;
       }
-      if (!transferId.equals(current.activeTransferId()) || current.handoffPhase() != expectedPhase
+      // Failure retirement is legal from every committed phase. Test it inside the same
+      // atomic update so an activation completion racing cleanup cannot strand the record.
+      boolean expectedPhaseMatches = current.handoffPhase() == expectedPhase
+          || (nextPhase == HandoffPhase.RETIRED
+              && (current.handoffPhase() == HandoffPhase.ACTIVE_DESTINATION
+                  || current.handoffPhase() == HandoffPhase.SOURCE_CLEANED));
+      if (!transferId.equals(current.activeTransferId()) || !expectedPhaseMatches
           || !current.handoffPhase().canTransitionTo(nextPhase)) {
         result.set(TransitionResult.rejectedMismatch(current));
         return current;

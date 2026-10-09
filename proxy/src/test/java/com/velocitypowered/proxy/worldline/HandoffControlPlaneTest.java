@@ -391,6 +391,94 @@ public class HandoffControlPlaneTest {
         CLIENT, "server-a", "server-b", "west", "east", 1, 1, 0, 0, 0);
   }
 
+  @Test
+  void acknowledgedFailureCleanupDoesNotRequireOrInventActivation() {
+    for (HandoffPhase failedPhase : List.of(HandoffPhase.COMMITTED,
+        HandoffPhase.ACTIVE_DESTINATION, HandoffPhase.SOURCE_CLEANED)) {
+      LivePlayerSessionStore sessions = stagedSessions();
+      sessions.commit(PLAYER, 0, TRANSFER, "server-a", "server-b");
+      if (failedPhase != HandoffPhase.COMMITTED) {
+        sessions.markActiveDestination(PLAYER, 1, TRANSFER);
+      }
+      if (failedPhase == HandoffPhase.SOURCE_CLEANED) {
+        sessions.markSourceCleaned(PLAYER, 1, TRANSFER);
+      }
+      RecordingSender sender = new RecordingSender(Outcome.ACK, Outcome.IO_FAILURE, Outcome.ACK);
+      HandoffControlPlane control = new HandoffControlPlane(sessions, sender);
+      assertEquals(ALREADY_APPLIED, control.retireDestination(envelope()).status());
+      assertEquals(ALREADY_APPLIED, control.cleanSourceAfterFailure(envelope()).status());
+      assertEquals(failedPhase, sessions.get(PLAYER).orElseThrow().handoffPhase());
+      assertEquals(APPLIED, sessions.retireFailedTransfer(PLAYER, 1, TRANSFER).status());
+      assertEquals(ALREADY_APPLIED, sessions.retireFailedTransfer(PLAYER, 1, TRANSFER).status());
+      assertTrue(sessions.get(PLAYER).isEmpty());
+      assertEquals(HandoffPhase.RETIRED, sessions.retiredTransfer(TRANSFER).orElseThrow().handoffPhase());
+      assertEquals("server-b", sessions.retiredTransfer(TRANSFER).orElseThrow().authoritativeServerId());
+      assertEquals(List.of("server-b:RETIRE_DESTINATION", "server-a:CLEAN_SOURCE",
+          "server-a:CLEAN_SOURCE"), sender.commands);
+    }
+  }
+
+  @Test
+  void failedCleanupRetainsCommittedStateAndRejectsStaleCommands() {
+    LivePlayerSessionStore sessions = stagedSessions();
+    sessions.commit(PLAYER, 0, TRANSFER, "server-a", "server-b");
+    RecordingSender sender = new RecordingSender(Outcome.IO_FAILURE,
+        Outcome.IO_FAILURE, Outcome.IO_FAILURE);
+    HandoffControlPlane control = new HandoffControlPlane(sessions, sender);
+    assertEquals(LivePlayerSessionStore.Status.CONTROL_UNAVAILABLE,
+        control.cleanSourceAfterFailure(envelope()).status());
+    assertEquals(HandoffPhase.COMMITTED, sessions.get(PLAYER).orElseThrow().handoffPhase());
+    assertEquals(3, sender.commands.size());
+    sessions.remove(PLAYER);
+    sessions.putActive(PLAYER, UUID.randomUUID(), "server-a");
+    assertEquals(LivePlayerSessionStore.Status.REJECTED_MISMATCH,
+        control.cleanSourceAfterFailure(envelope()).status());
+    assertEquals(3, sender.commands.size());
+  }
+
+  @Test
+  void oldControlCallbacksCannotTargetAnAuthenticatedReconnect() {
+    LivePlayerSessionStore sessions = stagedSessions();
+    sessions.commit(PLAYER, 0, TRANSFER, "server-a", "server-b");
+    sessions.retireFailedTransfer(PLAYER, 1, TRANSFER);
+    UUID fresh = UUID.randomUUID();
+    sessions.registerAuthenticatedConnection(PLAYER, fresh, "server-a", () -> true);
+    RecordingSender sender = new RecordingSender();
+    HandoffControlPlane control = new HandoffControlPlane(sessions, sender);
+    assertEquals(LivePlayerSessionStore.Status.REJECTED_MISMATCH, control.prepare(envelope(), TARGET).status());
+    assertEquals(LivePlayerSessionStore.Status.REJECTED_MISMATCH, control.abort(envelope()).status());
+    assertEquals(LivePlayerSessionStore.Status.REJECTED_MISMATCH,
+        control.freezeSource(envelope()).transition().status());
+    assertEquals(LivePlayerSessionStore.Status.REJECTED_MISMATCH, control.retireDestination(envelope()).status());
+    assertEquals(LivePlayerSessionStore.Status.REJECTED_MISMATCH, control.cleanSourceAfterFailure(envelope()).status());
+    assertTrue(sender.commands.isEmpty());
+    assertEquals(fresh, sessions.get(PLAYER).orElseThrow().clientConnectionId());
+  }
+
+  @Test
+  void commandsCannotReviveADisconnectedTransferAfterHistoryExpires() {
+    var now = new java.util.concurrent.atomic.AtomicLong();
+    LivePlayerSessionStore sessions = new LivePlayerSessionStore((name, before, after) -> { },
+        1, java.time.Duration.ofNanos(10), now::get);
+    sessions.putActive(PLAYER, CLIENT, "server-a");
+    sessions.beginTransfer(PLAYER, 0, "server-a", TRANSFER);
+    sessions.markDestinationReady(PLAYER, 0, TRANSFER);
+    sessions.markSourceFrozen(PLAYER, 0, TRANSFER);
+    sessions.markSnapshotStaged(PLAYER, 0, TRANSFER);
+    sessions.commit(PLAYER, 0, TRANSFER, "server-a", "server-b");
+    sessions.retireFailedTransfer(PLAYER, 1, TRANSFER);
+    now.set(11);
+    assertTrue(sessions.retiredTransfer(TRANSFER).isEmpty());
+    RecordingSender sender = new RecordingSender();
+    HandoffControlPlane control = new HandoffControlPlane(sessions, sender);
+    assertEquals(LivePlayerSessionStore.Status.MISSING_SESSION, control.prepare(envelope(), TARGET).status());
+    assertEquals(LivePlayerSessionStore.Status.MISSING_SESSION,
+        control.freezeSource(envelope()).transition().status());
+    assertEquals(LivePlayerSessionStore.Status.MISSING_SESSION, control.stageSnapshot(envelope(), new byte[0]).status());
+    assertEquals(LivePlayerSessionStore.Status.MISSING_SESSION, control.activateDestination(envelope()).status());
+    assertTrue(sender.commands.isEmpty());
+  }
+
   private static LivePlayerSessionStore stagedSessions() {
     LivePlayerSessionStore sessions = new LivePlayerSessionStore();
     sessions.putActive(PLAYER, CLIENT, "server-a");

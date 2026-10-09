@@ -358,6 +358,147 @@ public class LivePlayerSessionStoreTest {
         UUID.fromString("00000000-0000-0000-0000-000000000005")).status());
   }
 
+  @Test
+  void retiredFailureMovesToHistoryAndRejectsLateActivationAndSourceResurrection() {
+    LivePlayerSessionStore store = stagedStore();
+    assertEquals(REJECTED_MISMATCH, store.retireFailedTransfer(PLAYER, 0, TRANSFER).status());
+    store.commit(PLAYER, 0, TRANSFER, "server-a", "server-b");
+    assertEquals(REJECTED_STALE_EPOCH, store.retireFailedTransfer(PLAYER, 0, TRANSFER).status());
+    assertEquals(REJECTED_MISMATCH,
+        store.retireFailedTransfer(PLAYER, 1, UUID.randomUUID()).status());
+    assertEquals(APPLIED, store.retireFailedTransfer(PLAYER, 1, TRANSFER).status());
+    assertTrue(store.get(PLAYER).isEmpty());
+    assertEquals(HandoffPhase.RETIRED, store.retiredTransfer(TRANSFER).orElseThrow().handoffPhase());
+    assertEquals(LivePlayerSessionStore.Status.MISSING_SESSION,
+        store.markActiveDestination(PLAYER, 1, TRANSFER).status());
+    assertFalse(store.mayForwardGameplay(binding("server-b", 1, 1, TRANSFER)));
+    assertFalse(store.mayForwardGameplay(binding("server-a", 0, 0, null)));
+  }
+
+  @Test
+  void repeatedAuthenticatedReconnectsRejectOldCallbacksInBothDirections() {
+    LivePlayerSessionStore store = new LivePlayerSessionStore();
+    for (int attempt = 0; attempt < 50; attempt++) {
+      String source = attempt % 2 == 0 ? "server-a" : "server-b";
+      String destination = attempt % 2 == 0 ? "server-b" : "server-a";
+      UUID oldClient = UUID.randomUUID();
+      UUID transfer = UUID.randomUUID();
+      assertTrue(store.registerAuthenticatedConnection(PLAYER, oldClient, source, () -> true).isPresent());
+      store.beginTransfer(PLAYER, oldClient, 0, source, transfer);
+      store.markDestinationReady(PLAYER, 0, transfer);
+      store.markSourceFrozen(PLAYER, 0, transfer);
+      store.markSnapshotStaged(PLAYER, 0, transfer);
+      store.commit(PLAYER, 0, transfer, source, destination);
+      store.retireFailedTransfer(PLAYER, 1, transfer);
+      UUID newClient = UUID.randomUUID();
+      assertTrue(store.registerAuthenticatedConnection(PLAYER, newClient, source, () -> true).isPresent());
+      assertTrue(store.registerAuthenticatedConnection(PLAYER, oldClient, destination, () -> false).isEmpty());
+      assertEquals(REJECTED_MISMATCH,
+          store.beginTransfer(PLAYER, oldClient, 0, source, transfer).status());
+      assertEquals(REJECTED_STALE_EPOCH, store.markActiveDestination(PLAYER, 1, transfer).status());
+      assertEquals(ALREADY_APPLIED, store.retireFailedTransfer(PLAYER, 1, transfer).status());
+      assertTrue(store.remove(PLAYER, oldClient).isEmpty());
+      assertFalse(store.mayForwardGameplay(new BackendSessionBinding(PLAYER, oldClient,
+          source, 0, 0, null)));
+      assertTrue(store.mayForwardGameplay(new BackendSessionBinding(PLAYER, newClient,
+          source, 0, 0, null)));
+      UUID newTransfer = UUID.randomUUID();
+      assertEquals(APPLIED, store.beginTransfer(PLAYER, newClient, 0, source, newTransfer).status());
+      assertEquals(newClient, store.get(PLAYER).orElseThrow().clientConnectionId());
+      assertTrue(store.remove(PLAYER, newClient).isPresent());
+    }
+  }
+
+  @Test
+  void authenticatedRegistrationWinsOverAnAlreadyRunningOldRegistration() throws Exception {
+    LivePlayerSessionStore store = new LivePlayerSessionStore();
+    UUID fresh = UUID.randomUUID();
+    var currentAuthenticated = new java.util.concurrent.atomic.AtomicReference<>(CLIENT);
+    var oldChecked = new java.util.concurrent.CountDownLatch(1);
+    var releaseOld = new java.util.concurrent.CountDownLatch(1);
+    try (var workers = java.util.concurrent.Executors.newFixedThreadPool(2)) {
+      var oldRegistration = workers.submit(() -> store.registerAuthenticatedConnection(
+          PLAYER, CLIENT, "server-a", () -> {
+            boolean authorized = currentAuthenticated.get().equals(CLIENT);
+            oldChecked.countDown();
+            try {
+              if (!releaseOld.await(5, java.util.concurrent.TimeUnit.SECONDS)) {
+                throw new AssertionError("registration test latch timed out");
+              }
+            } catch (InterruptedException interrupted) {
+              Thread.currentThread().interrupt();
+              throw new AssertionError(interrupted);
+            }
+            return authorized;
+          }));
+      assertTrue(oldChecked.await(5, java.util.concurrent.TimeUnit.SECONDS));
+      currentAuthenticated.set(fresh);
+      var newRegistration = workers.submit(() -> store.registerAuthenticatedConnection(
+          PLAYER, fresh, "server-b", () -> currentAuthenticated.get().equals(fresh)));
+      releaseOld.countDown();
+      oldRegistration.get(5, java.util.concurrent.TimeUnit.SECONDS);
+      assertTrue(newRegistration.get(5, java.util.concurrent.TimeUnit.SECONDS).isPresent());
+      assertTrue(store.registerAuthenticatedConnection(PLAYER, CLIENT, "server-a",
+          () -> currentAuthenticated.get().equals(CLIENT)).isEmpty());
+      assertEquals(fresh, store.get(PLAYER).orElseThrow().clientConnectionId());
+      assertTrue(store.remove(PLAYER, CLIENT).isEmpty());
+    } finally {
+      releaseOld.countDown();
+    }
+  }
+
+  @Test
+  void terminalHistoryIsCapacityAndTimeBoundedWithoutRestoringAuthority() {
+    var now = new java.util.concurrent.atomic.AtomicLong();
+    LivePlayerSessionStore store = new LivePlayerSessionStore((name, before, after) -> { },
+        2, java.time.Duration.ofNanos(10), now::get);
+    UUID lastTransfer = null;
+    for (int attempt = 0; attempt < 5; attempt++) {
+      lastTransfer = UUID.randomUUID();
+      store.putActive(PLAYER, UUID.randomUUID(), "server-a");
+      store.beginTransfer(PLAYER, 0, "server-a", lastTransfer);
+      store.markDestinationReady(PLAYER, 0, lastTransfer);
+      store.markSourceFrozen(PLAYER, 0, lastTransfer);
+      store.markSnapshotStaged(PLAYER, 0, lastTransfer);
+      store.commit(PLAYER, 0, lastTransfer, "server-a", "server-b");
+      store.retireFailedTransfer(PLAYER, 1, lastTransfer);
+      assertTrue(store.get(PLAYER).isEmpty());
+      assertTrue(store.retainedTerminalCount() <= 2);
+    }
+    now.set(11);
+    assertEquals(0, store.retainedTerminalCount());
+    assertTrue(store.retiredTransfer(lastTransfer).isEmpty());
+    UUID fresh = UUID.randomUUID();
+    store.registerAuthenticatedConnection(PLAYER, fresh, "server-a", () -> true);
+    assertEquals(REJECTED_STALE_EPOCH, store.retireFailedTransfer(PLAYER, 1, lastTransfer).status());
+    assertEquals(fresh, store.get(PLAYER).orElseThrow().clientConnectionId());
+  }
+
+  @Test
+  void racingActivationCannotResurrectOrPreventFailureRetirement() throws Exception {
+    try (var workers = java.util.concurrent.Executors.newFixedThreadPool(2)) {
+      for (int attempt = 0; attempt < 100; attempt++) {
+        LivePlayerSessionStore store = stagedStore();
+        store.commit(PLAYER, 0, TRANSFER, "server-a", "server-b");
+        var start = new java.util.concurrent.CyclicBarrier(2);
+        var activation = workers.submit(() -> {
+          start.await(5, java.util.concurrent.TimeUnit.SECONDS);
+          return store.markActiveDestination(PLAYER, 1, TRANSFER);
+        });
+        var retirement = workers.submit(() -> {
+          start.await(5, java.util.concurrent.TimeUnit.SECONDS);
+          return store.retireFailedTransfer(PLAYER, 1, TRANSFER);
+        });
+        var activated = activation.get(5, java.util.concurrent.TimeUnit.SECONDS).status();
+        assertTrue(activated == APPLIED || activated == LivePlayerSessionStore.Status.MISSING_SESSION);
+        assertEquals(APPLIED, retirement.get(5, java.util.concurrent.TimeUnit.SECONDS).status());
+        assertTrue(store.get(PLAYER).isEmpty());
+        assertEquals(HandoffPhase.RETIRED, store.retiredTransfer(TRANSFER).orElseThrow().handoffPhase());
+        assertFalse(store.mayForwardGameplay(binding("server-b", 1, 1, TRANSFER)));
+      }
+    }
+  }
+
   private static LivePlayerSessionStore stagedStore() {
     LivePlayerSessionStore store = new LivePlayerSessionStore();
     store.putActive(PLAYER, CLIENT, "server-a");

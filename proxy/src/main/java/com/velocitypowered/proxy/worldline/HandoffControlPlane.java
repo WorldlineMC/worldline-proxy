@@ -88,7 +88,8 @@ public final class HandoffControlPlane {
     }
     LivePlayerSessionStore.TransitionResult begin = transition(
         HandoffPhase.PREPARING_DESTINATION, envelope,
-        () -> sessions.beginTransfer(envelope.playerUuid(), envelope.playerSessionEpoch(),
+        () -> sessions.beginTransfer(envelope.playerUuid(), envelope.clientConnectionId(),
+            envelope.playerSessionEpoch(),
             envelope.sourceServerId(), envelope.transferId()));
     if (begin.status() != LivePlayerSessionStore.Status.APPLIED
         && begin.status() != LivePlayerSessionStore.Status.ALREADY_APPLIED) {
@@ -120,7 +121,7 @@ public final class HandoffControlPlane {
    */
   public LivePlayerSessionStore.TransitionResult abort(final ControlEnvelope envelope) {
     validateProtocol(envelope);
-    LivePlayerSessionStore.TransitionResult ownership = validateOwnership(envelope);
+    LivePlayerSessionStore.TransitionResult ownership = validateOwnership(envelope, true);
     if (ownership != null) {
       return ownership;
     }
@@ -264,6 +265,34 @@ public final class HandoffControlPlane {
     }).result();
   }
 
+  /**
+   * Acknowledges source resource cleanup on the failure path without claiming successful
+   * destination activation. The coordinator retires the proxy record only after both remote
+   * terminal commands acknowledge; otherwise its committed state remains available for retry.
+   */
+  public LivePlayerSessionStore.TransitionResult cleanSourceAfterFailure(
+      final ControlEnvelope envelope) {
+    validateProtocol(envelope);
+    ControlEnvelope committed = committedEnvelope(envelope);
+    return terminalRetry.execute(() -> {
+      LivePlayerSession current = sessions.get(envelope.playerUuid()).orElse(null);
+      if (current == null) {
+        return LivePlayerSessionStore.TransitionResult.missing();
+      }
+      if (!current.clientConnectionId().equals(committed.clientConnectionId())
+          || !committed.transferId().equals(current.activeTransferId())
+          || current.playerSessionEpoch() != committed.playerSessionEpoch()
+          || current.routeGeneration() != committed.routeGeneration()
+          || !current.authoritativeServerId().equals(committed.destinationServerId())) {
+        return LivePlayerSessionStore.TransitionResult.rejectedMismatch(current);
+      }
+      LivePlayerSessionStore.TransitionResult rejection = beforeServerCommand(
+          envelope.sourceServerId(), "CLEAN_SOURCE", committed);
+      return rejection == null
+          ? LivePlayerSessionStore.TransitionResult.alreadyApplied(current) : rejection;
+    }).result();
+  }
+
   /** Releases destination resources after a terminal post-commit failure. */
   public LivePlayerSessionStore.TransitionResult retireDestination(
       final ControlEnvelope envelope) {
@@ -350,6 +379,22 @@ public final class HandoffControlPlane {
 
   private LivePlayerSessionStore.TransitionResult validateOwnership(
       final ControlEnvelope envelope) {
+    return validateOwnership(envelope, false);
+  }
+
+  private LivePlayerSessionStore.TransitionResult validateOwnership(
+      final ControlEnvelope envelope, final boolean allowDisconnectedAbort) {
+    LivePlayerSession retired = sessions.retiredTransfer(envelope.transferId()).orElse(null);
+    if (retired != null) {
+      return LivePlayerSessionStore.TransitionResult.rejectedMismatch(retired);
+    }
+    LivePlayerSession session = sessions.get(envelope.playerUuid()).orElse(null);
+    if (session == null && !allowDisconnectedAbort) {
+      return LivePlayerSessionStore.TransitionResult.missing();
+    }
+    if (session != null && !session.clientConnectionId().equals(envelope.clientConnectionId())) {
+      return LivePlayerSessionStore.TransitionResult.rejectedMismatch(session);
+    }
     StaticPartitionMap current = partitions;
     if (current == null) {
       return null;

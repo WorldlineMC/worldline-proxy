@@ -187,6 +187,44 @@ public class ServerboundMovementRouterTest {
         new ServerboundMovePlayerPacket.Rotation()).action());
   }
 
+  @Test
+  void buffersSourceReturnAndRotationAfterCrossingInOrder() throws Exception {
+    ServerboundMovementRouter router = router();
+    router.route("server-a", position(-0.25));
+    router.markDestinationReady();
+    var crossing = position(0.25);
+    var returning = position(-0.10);
+    var rotation = new ServerboundMovePlayerPacket.Rotation();
+    assertEquals(WITHHOLD_CROSSING, router.route("server-a", crossing).action());
+    assertEquals(WITHHOLD_CROSSING, router.route("server-a", returning).action());
+    assertEquals(WITHHOLD_CROSSING, router.route("server-a", rotation).action());
+    assertEquals(List.of(crossing, returning, rotation), router.drainBuffer());
+  }
+
+  @Test
+  void firstReverseCrossingUsesDestinationAuthorityAfterSplice() throws Exception {
+    ServerboundMovementRouter router = router();
+    router.route("server-a", position(-0.25));
+    router.markDestinationReady();
+    router.route("server-a", position(0.25));
+    router.drainBuffer();
+    router.resetPositionAfterSplice();
+    assertEquals(PREPARE_AND_WITHHOLD, router.route("server-b", position(-0.10)).action());
+    assertEquals(1, router.bufferedPackets().size());
+  }
+
+  @Test
+  void ordinaryDestinationMovementRemainsUnbufferedAfterSplice() throws Exception {
+    ServerboundMovementRouter router = router();
+    router.route("server-a", position(-0.25));
+    router.markDestinationReady();
+    router.route("server-a", position(0.25));
+    router.drainBuffer();
+    router.resetPositionAfterSplice();
+    assertEquals(FORWARD, router.route("server-b", position(32)).action());
+    assertTrue(router.bufferedPackets().isEmpty());
+  }
+
   private ServerboundMovementRouter router() throws Exception {
     return new ServerboundMovementRouter(detector());
   }
