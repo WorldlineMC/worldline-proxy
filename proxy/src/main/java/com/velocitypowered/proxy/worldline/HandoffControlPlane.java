@@ -88,7 +88,8 @@ public final class HandoffControlPlane {
     }
     LivePlayerSessionStore.TransitionResult begin = transition(
         HandoffPhase.PREPARING_DESTINATION, envelope,
-        () -> sessions.beginTransfer(envelope.playerUuid(), envelope.playerSessionEpoch(),
+        () -> sessions.beginTransfer(envelope.playerUuid(), envelope.clientConnectionId(),
+            envelope.playerSessionEpoch(),
             envelope.sourceServerId(), envelope.transferId()));
     if (begin.status() != LivePlayerSessionStore.Status.APPLIED
         && begin.status() != LivePlayerSessionStore.Status.ALREADY_APPLIED) {
@@ -120,7 +121,7 @@ public final class HandoffControlPlane {
    */
   public LivePlayerSessionStore.TransitionResult abort(final ControlEnvelope envelope) {
     validateProtocol(envelope);
-    LivePlayerSessionStore.TransitionResult ownership = validateOwnership(envelope);
+    LivePlayerSessionStore.TransitionResult ownership = validateOwnership(envelope, true);
     if (ownership != null) {
       return ownership;
     }
@@ -378,6 +379,22 @@ public final class HandoffControlPlane {
 
   private LivePlayerSessionStore.TransitionResult validateOwnership(
       final ControlEnvelope envelope) {
+    return validateOwnership(envelope, false);
+  }
+
+  private LivePlayerSessionStore.TransitionResult validateOwnership(
+      final ControlEnvelope envelope, final boolean allowDisconnectedAbort) {
+    LivePlayerSession retired = sessions.retiredTransfer(envelope.transferId()).orElse(null);
+    if (retired != null) {
+      return LivePlayerSessionStore.TransitionResult.rejectedMismatch(retired);
+    }
+    LivePlayerSession session = sessions.get(envelope.playerUuid()).orElse(null);
+    if (session == null && !allowDisconnectedAbort) {
+      return LivePlayerSessionStore.TransitionResult.missing();
+    }
+    if (session != null && !session.clientConnectionId().equals(envelope.clientConnectionId())) {
+      return LivePlayerSessionStore.TransitionResult.rejectedMismatch(session);
+    }
     StaticPartitionMap current = partitions;
     if (current == null) {
       return null;

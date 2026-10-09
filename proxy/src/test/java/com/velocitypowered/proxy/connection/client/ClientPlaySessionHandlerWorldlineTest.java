@@ -355,12 +355,65 @@ public class ClientPlaySessionHandlerWorldlineTest {
       verify(fixture.control, never()).abort(fixture.envelope);
       assertNull(getField(fixture.handler, "worldlineReplayBuffer"));
       assertEquals(0, replay.size());
+      var retained = acknowledged ? fixture.sessions.retiredTransfer(fixture.transfer)
+          : fixture.sessions.get(PLAYER);
       assertEquals(acknowledged ? HandoffPhase.RETIRED : HandoffPhase.COMMITTED,
-          fixture.sessions.get(PLAYER).orElseThrow().handoffPhase());
-      assertEquals("server-b", fixture.sessions.get(PLAYER).orElseThrow().authoritativeServerId());
+          retained.orElseThrow().handoffPhase());
+      assertEquals("server-b", retained.orElseThrow().authoritativeServerId());
+      if (acknowledged) {
+        assertTrue(fixture.sessions.get(PLAYER).isEmpty());
+      }
+      fixture.handler.disconnected();
+      verify(fixture.control, never()).abort(fixture.envelope);
       verify(fixture.player, times(acknowledged ? 1 : 0)).teardown();
       verify(fixture.player, times(acknowledged ? 1 : 0))
           .disconnectWorldlineSourceAfterCleanup(fixture.source);
+    }
+  }
+
+  @Test
+  void authenticatedReconnectStartsHandoffAndOldHandlerCannotRemoveIt() throws Exception {
+    for (String backend : List.of("server-a", "server-b")) {
+      try (MovementFixture fixture = new MovementFixture()) {
+        fixture.sessions.retireFailedTransfer(PLAYER, 1, fixture.transfer);
+        setField(fixture.handler, "worldlinePostCommitTerminated", true);
+        ConnectedPlayer fresh = mock(ConnectedPlayer.class);
+        MinecraftConnection freshConnection = mock(MinecraftConnection.class);
+        VelocityServerConnection freshBackend = mock(VelocityServerConnection.class, RETURNS_DEEP_STUBS);
+        when(fresh.getProtocolVersion()).thenReturn(ProtocolVersion.MINECRAFT_26_1);
+        when(fresh.getUniqueId()).thenReturn(PLAYER);
+        when(fresh.getConnection()).thenReturn(freshConnection);
+        when(freshConnection.eventLoop()).thenReturn(fixture.eventLoop);
+        when(fresh.getConnectedServer()).thenReturn(freshBackend);
+        when(freshBackend.getServer().getServerInfo().getName()).thenReturn(backend);
+        when(fixture.server.getPlayer(PLAYER)).thenReturn(Optional.of(fresh));
+        when(fixture.control.prepareTarget(any(), anyDouble(), anyDouble(), anyDouble()))
+            .thenReturn(new PrepareTarget("Test", "world", "minecraft:overworld", "test", 0, 64, 0, 1));
+        when(fixture.control.prepare(any(), any())).thenAnswer(invocation -> {
+          ControlEnvelope next = invocation.getArgument(0);
+          return fixture.sessions.beginTransfer(PLAYER, next.clientConnectionId(),
+              next.playerSessionEpoch(), next.sourceServerId(), next.transferId());
+        });
+        ClientPlaySessionHandler freshHandler = new ClientPlaySessionHandler(fixture.server, fresh);
+        assertFalse(freshHandler.handle(position(backend.equals("server-a") ? -8 : 8)));
+        verify(fixture.control, timeout(5_000)).prepare(any(), any());
+        drain(fixture.eventLoop);
+        UUID freshClient = (UUID) getField(freshHandler, "worldlineClientConnectionId");
+        assertEquals(freshClient, fixture.sessions.get(PLAYER).orElseThrow().clientConnectionId());
+        assertNotEquals(CLIENT, freshClient);
+        assertEquals(backend, fixture.sessions.get(PLAYER).orElseThrow().authoritativeServerId());
+        fixture.handler.disconnected();
+        assertEquals(freshClient, fixture.sessions.get(PLAYER).orElseThrow().clientConnectionId());
+        verify(fixture.control, never()).abort(fixture.envelope);
+        when(fixture.control.abort(any())).thenAnswer(invocation -> {
+          ControlEnvelope current = invocation.getArgument(0);
+          return fixture.sessions.abortTransfer(PLAYER, current.playerSessionEpoch(),
+              current.transferId(), current.sourceServerId());
+        });
+        freshHandler.disconnected();
+        assertTrue(fixture.sessions.get(PLAYER).isEmpty());
+        verify(fresh).teardown();
+      }
     }
   }
 
@@ -413,6 +466,7 @@ public class ClientPlaySessionHandlerWorldlineTest {
       when(server.getWorldlineLiveSessions()).thenReturn(sessions);
       when(player.getProtocolVersion()).thenReturn(ProtocolVersion.MINECRAFT_26_1);
       when(player.getUniqueId()).thenReturn(PLAYER);
+      when(server.getPlayer(PLAYER)).thenReturn(Optional.of(player));
       when(player.getConnection()).thenReturn(connection);
       when(connection.eventLoop()).thenReturn(eventLoop);
       when(player.getConnectedServer()).thenReturn(source);
@@ -428,6 +482,7 @@ public class ClientPlaySessionHandlerWorldlineTest {
         sessions.commit(PLAYER, 0, transfer, "server-a", "server-b");
       }
       handler = new ClientPlaySessionHandler(server, player);
+      setField(handler, "worldlineClientConnectionId", CLIENT);
       router = (ServerboundMovementRouter) getField(handler, "worldlineMovementRouter");
       setField(handler, "worldlineTransferId", transfer);
       setField(handler, "worldlineEnvelope", envelope);

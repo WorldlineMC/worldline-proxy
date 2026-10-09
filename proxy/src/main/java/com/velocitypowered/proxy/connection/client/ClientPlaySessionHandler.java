@@ -100,6 +100,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
+import java.util.Optional;
 import java.util.Queue;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
@@ -689,14 +690,19 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
       return;
     }
     LivePlayerSessionStore sessions = server.getWorldlineLiveSessions();
-    if (sessions.get(player.getUniqueId()).isEmpty()) {
-      sessions.putActive(player.getUniqueId(), worldlineClientConnectionId, serverId);
-    }
-    LivePlayerSession liveSession = sessions.get(player.getUniqueId()).orElseThrow();
     VelocityServerConnection sourceConnection = player.getConnectedServer();
     if (sourceConnection == null) {
       return;
     }
+    Optional<LivePlayerSession> registered = sessions.registerAuthenticatedConnection(
+        player.getUniqueId(), worldlineClientConnectionId, serverId,
+        () -> !player.getConnection().isClosed()
+            && player.getConnectedServer() == sourceConnection
+            && server.getPlayer(player.getUniqueId()).orElse(null) == player);
+    if (registered.isEmpty()) {
+      return;
+    }
+    LivePlayerSession liveSession = registered.orElseThrow();
     BackendSessionBinding steadyBinding = new BackendSessionBinding(player.getUniqueId(),
         liveSession.clientConnectionId(), serverId, liveSession.playerSessionEpoch(),
         liveSession.routeGeneration(), null);
@@ -1313,6 +1319,11 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
 
   @Override
   public void disconnected() {
+    // The terminal worker owns teardown. Its live record may already have moved to bounded
+    // history, so absence must never reclassify this old connection as a pre-commit abort.
+    if (worldlinePostCommitTerminated) {
+      return;
+    }
     if (worldlineEnvelope != null && worldlineCommitted(worldlineEnvelope)) {
       failWorldlinePostCommit(worldlineEnvelope, "client disconnected after commit");
       return;
